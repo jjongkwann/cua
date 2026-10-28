@@ -31,6 +31,9 @@
 //                    CUA_APPKIT_TASK_DENSITY=12|24 (task mode only) also adds
 //                    benign distractor controls in a sidebar before them, for
 //                    measuring jev-use accuracy at larger candidate sets.
+//   focus_oracle   — opt-in (CUA_APPKIT_FOCUS_ORACLE=<path>): launches in the
+//                    background and journals AppKit's own focus state and
+//                    key-downs (see FocusOracle).
 //
 // AX identifiers (via `setAccessibilityIdentifier(_:)`) match the IDs in
 // scenarios.json. Window title is set to "CuaTestHarness AppKit" so the
@@ -196,8 +199,13 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     }
 
     func show() {
-        window.makeKeyAndOrderFront(nil)
-        window.center()
+        if FocusOracle.shared == nil {
+            window.makeKeyAndOrderFront(nil)
+            window.center()
+        } else {
+            window.center()
+            window.orderBack(nil)
+        }
     }
 
     // MARK: - Layout
@@ -716,6 +724,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
 
     @objc func onArrangeLeft(_ sender: NSMenuItem) {
         menuActionLabel.stringValue = "menu_action=window_arrange_left"
+        FocusOracle.shared?.append("menu_action", ["action": "window_arrange_left"])
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -833,7 +842,11 @@ final class BringToFrontMatrixWindows {
         secondary.isReleasedWhenClosed = false
         secondary.isRestorable = false
         secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
-        secondary.orderFront(nil)
+        if FocusOracle.shared == nil {
+            secondary.orderFront(nil)
+        } else {
+            secondary.orderBack(nil)
+        }
 
         if mode == "sheet" {
             let candidate = NSWindow(
@@ -918,6 +931,80 @@ func installMenuBar(target: HarnessWindowController) {
     NSApp.windowsMenu = windowMenu
 }
 
+// MARK: - Focus oracle
+
+/// Opt-in focus oracle (CUA_APPKIT_FOCUS_ORACLE=<path>) for background input
+/// certification. The app launches in the background: it never activates
+/// itself and orders its windows behind the user's, so the user's app keeps
+/// the front, its key window and the keyboard. It journals, as JSON lines,
+/// AppKit's own view of focus: app activation, each window's key and main
+/// changes, every key-down with the window and responder that received it, and
+/// each Arrange Left command. Every line carries `is_active`, `key_window` and
+/// `main_window` as AppKit reported them at that moment.
+final class FocusOracle {
+    static let shared: FocusOracle? = ProcessInfo.processInfo
+        .environment["CUA_APPKIT_FOCUS_ORACLE"]
+        .map { FocusOracle(journal: URL(fileURLWithPath: $0)) }
+
+    let journal: URL
+    var observers: [NSObjectProtocol] = []
+    var keyMonitor: Any?
+
+    init(journal: URL) {
+        self.journal = journal
+        FileManager.default.createFile(atPath: journal.path, contents: nil)
+    }
+
+    func append(_ kind: String, _ fields: [String: Any] = [:]) {
+        var value = fields
+        value["kind"] = kind
+        value["uptime"] = ProcessInfo.processInfo.systemUptime
+        value["is_active"] = NSApp.isActive
+        value["key_window"] = NSApp.keyWindow?.windowNumber ?? 0
+        value["main_window"] = NSApp.mainWindow?.windowNumber ?? 0
+        var data = try! JSONSerialization.data(withJSONObject: value, options: [.sortedKeys])
+        data.append(0x0a)
+        let file = try! FileHandle(forWritingTo: journal)
+        defer { try! file.close() }
+        try! file.seekToEnd()
+        try! file.write(contentsOf: data)
+    }
+
+    func install() {
+        let center = NotificationCenter.default
+        let appEvents: [(Notification.Name, String)] = [
+            (NSApplication.didBecomeActiveNotification, "app_active"),
+            (NSApplication.didResignActiveNotification, "app_resign_active"),
+        ]
+        for (name, kind) in appEvents {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) {
+                [weak self] _ in self?.append(kind)
+            })
+        }
+        let windowEvents: [(Notification.Name, String)] = [
+            (NSWindow.didBecomeKeyNotification, "window_key"),
+            (NSWindow.didResignKeyNotification, "window_resign_key"),
+            (NSWindow.didBecomeMainNotification, "window_main"),
+            (NSWindow.didResignMainNotification, "window_resign_main"),
+        ]
+        for (name, kind) in windowEvents {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) {
+                [weak self] note in
+                self?.append(kind, ["window": (note.object as? NSWindow)?.windowNumber ?? 0])
+            })
+        }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let responder = event.window?.firstResponder
+            self?.append("key_down", [
+                "window": event.windowNumber,
+                "responder": responder.map { String(describing: type(of: $0)) } ?? "",
+                "characters": event.characters ?? "",
+            ])
+            return event
+        }
+    }
+}
+
 // MARK: - Entry
 
 final class SingleClickReceiver: NSView {
@@ -999,7 +1086,17 @@ struct CuaAppKitHarness {
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
         }
-        app.activate(ignoringOtherApps: true)
+        if let oracle = FocusOracle.shared {
+            oracle.install()
+            oracle.append("ready", [
+                "pid": Int(getpid()),
+                "window": controller.window.windowNumber,
+                "secondary": matrixWindows?.secondary.windowNumber ?? 0,
+                "sheet": matrixWindows?.sheet?.windowNumber ?? 0,
+            ])
+        } else {
+            app.activate(ignoringOtherApps: true)
+        }
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
         if let delay = ProcessInfo.processInfo.environment["CUA_APPKIT_LAUNCH_DELAY_MS"]
             .flatMap(Double.init), delay > 0 {

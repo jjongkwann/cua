@@ -83,3 +83,7 @@ cua-cursor-motion = { path = "../cua-cursor-motion" }
 [[test]]
 name = "embedded_menu_restore"
 harness = false
+
+[[test]]
+name = "background_focus_oracle"
+harness = false
