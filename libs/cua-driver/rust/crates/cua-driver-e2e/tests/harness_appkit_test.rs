@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use cua_driver_testkit::ax::{element_index_by_id, element_index_containing, has_id, looks_empty};
 use cua_driver_testkit::e2e::{
     execute_case, native_background_case, native_foreground_case, native_readonly_case,
-    recording_evidence, DriverRoute, Evidence, Observation, OracleKind, RefusalCode, Targeting,
+    recording_evidence, DriverRoute, Evidence, Observation, OracleKind, Targeting,
 };
 use cua_driver_testkit::observer::{NativeObserver, ObserverBackend, TargetWindow};
 use cua_driver_testkit::sentinel::run_with_background_oracles;
@@ -1077,7 +1077,7 @@ fn harness_appkit_invoke_menu_live_path() {
                 "{}",
                 background.raw
             );
-            await_menu_action(driver, pid, wid);
+            await_label(driver, pid, wid, "menu_action=window_arrange_left");
             let apps = driver.call("list_apps", serde_json::json!({}));
             let distractor_active = apps.structured()["apps"]
                 .as_array()
@@ -1092,10 +1092,19 @@ fn harness_appkit_invoke_menu_live_path() {
                 apps.raw
             );
 
+            // Reset the fixture's label (its Reset button clears it) so the
+            // foreground leg proves its own run.
+            let reset = element_token_by_id(&snapshot_elements(driver, pid, wid), "btn-reset");
+            let reset_result = driver.call("click", serde_json::json!({ "element_token": reset }));
+            assert!(
+                !reset_result.is_error(),
+                "reset click failed: {}",
+                reset_result.raw
+            );
+            await_label(driver, pid, wid, "menu_action=none");
+
             // The foreground route: bring the exact window to front, then
-            // invoke the menu. The fixture's label already reads
-            // window_arrange_left from the background run, so this leg proves
-            // the call and the activation hand-off, not the label.
+            // invoke the menu.
             let raised = driver.call(
                 "bring_to_front",
                 serde_json::json!({"pid": pid, "window_id": wid}),
@@ -1116,24 +1125,24 @@ fn harness_appkit_invoke_menu_live_path() {
                 invoked.text()
             );
             assert_eq!(invoked.action_effect(), Some("unverifiable"));
-            await_menu_action(driver, pid, wid);
+            await_label(driver, pid, wid, "menu_action=window_arrange_left");
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         },
     );
 }
 
-/// Poll for the fixture's Arrange Left label instead of sleeping a fixed
+/// Poll for `label` in the fixture's tree instead of sleeping a fixed
 /// 300 ms: a loaded runner delivers the action later.
-fn await_menu_action(driver: &mut McpDriver, pid: u32, wid: u64) {
+fn await_label(driver: &mut McpDriver, pid: u32, wid: u64, label: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let post = snapshot_elements(driver, pid, wid);
-        if post.tree_text().contains("menu_action=window_arrange_left") {
+        if post.tree_text().contains(label) {
             return;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "menu action did not reach fixture: {}",
+            "{label} did not appear in the fixture: {}",
             post.tree_text()
         );
         std::thread::sleep(Duration::from_millis(100));

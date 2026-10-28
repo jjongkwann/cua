@@ -171,10 +171,14 @@ mod native {
         }
     }
 
-    /// The user's side of focus, as WindowServer and Accessibility report it.
+    /// The user's side of focus, as WindowServer, NSWorkspace and
+    /// Accessibility report it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct UserFocus {
         front: Option<i32>,
+        /// `NSWorkspace.frontmostApplication`, the view the reactive focus
+        /// layer (`focus_steal`) acts on.
+        workspace_front: Option<i32>,
         key_focus: Option<i32>,
         window: Option<u32>,
         element_window: Option<u32>,
@@ -184,6 +188,7 @@ mod native {
         let front = skylight::front_process_pid();
         UserFocus {
             front,
+            workspace_front: platform_macos::apps::frontmost_pid(),
             key_focus: skylight::key_focus_pid(),
             window: front.and_then(ax::focused_window_id_of_pid),
             element_window: front.and_then(ax::focused_element_window_id_of_pid),
@@ -193,6 +198,7 @@ mod native {
     fn user_json(focus: UserFocus) -> Value {
         json!({
             "front_pid": focus.front,
+            "workspace_front_pid": focus.workspace_front,
             "key_focus_pid": focus.key_focus,
             "focused_window": focus.window,
             "focused_element_window": focus.element_window,
@@ -219,10 +225,10 @@ mod native {
         })
     }
 
-    /// Samples the user's front process and key-focus process every 5 ms, and
-    /// whether a fixture window sits above the user's front window every
-    /// 25 ms, until stopped. Returns each departure from `before` once per
-    /// change.
+    /// Samples the user's front process, NSWorkspace's frontmost application
+    /// and the key-focus process every 5 ms, and whether a fixture window sits
+    /// above the user's front window every 25 ms, until stopped. Returns each
+    /// departure from `before` once per change.
     struct Watch {
         stop: Arc<AtomicBool>,
         handle: std::thread::JoinHandle<Vec<String>>,
@@ -238,10 +244,14 @@ mod native {
                 let mut tick = 0u32;
                 while !flag.load(Ordering::Relaxed) {
                     let front = skylight::front_process_pid();
+                    let workspace = platform_macos::apps::frontmost_pid();
                     let key = skylight::key_focus_pid();
                     let mut now = Vec::new();
                     if front != before.front {
                         now.push(format!("front_pid={front:?}"));
+                    }
+                    if workspace != before.workspace_front {
+                        now.push(format!("workspace_front_pid={workspace:?}"));
                     }
                     if key != before.key_focus {
                         now.push(format!("key_focus_pid={key:?}"));
@@ -525,6 +535,36 @@ mod native {
             .map(str::to_owned)
     }
 
+    /// The element token of the first element in the main window's snapshot
+    /// with `role` and, when given, `label`.
+    fn element_token(
+        ctx: &Ctx,
+        fixture: &Fixture,
+        role: &str,
+        label: Option<&str>,
+    ) -> Result<String, String> {
+        let state = snapshot(ctx, fixture);
+        let elements = state
+            .pointer("/structuredContent/elements")
+            .or_else(|| state.pointer("/structured_content/elements"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let found = elements
+            .iter()
+            .find(|e| e["role"] == role && label.is_none_or(|label| e["label"] == label))
+            .ok_or_else(|| {
+                format!(
+                    "no {role} {label:?} in get_window_state: {}",
+                    serde_json::to_string(&elements).unwrap_or_default()
+                )
+            })?;
+        found["element_token"]
+            .as_str()
+            .ok_or_else(|| format!("the element has no element_token: {found}"))
+            .map(str::to_owned)
+    }
+
     fn setup_failure(message: String) -> Value {
         json!({ "isError": true, "content": [{ "type": "text", "text": message }] })
     }
@@ -582,7 +622,7 @@ mod native {
                 mode: "two-windows",
                 keys: Keys::Forbidden,
                 run: |ctx, fixture| arrange_left(ctx, fixture, fixture.secondary),
-                expect: |_, result, view| {
+                expect: |fixture, result, view| {
                     let mut failures = Vec::new();
                     // Arrange Left validates against the primary window being
                     // key; with the sibling bound it must refuse, never run
@@ -594,6 +634,9 @@ mod native {
                     if !view.menu_actions.is_empty() {
                         failures.push(format!("the command ran: {:?}", view.menu_actions));
                     }
+                    // The binding moved the app's focused window to the
+                    // sibling; the exit must have moved it back.
+                    failures.extend(focused_window_restored(fixture));
                     failures
                 },
             },
@@ -794,17 +837,129 @@ mod native {
                             result["input_after"]
                         ));
                     }
-                    if ax::focused_window_id_of_pid(fixture.pid) != Some(fixture.main) {
+                    failures.extend(focused_window_restored(fixture));
+                    failures
+                },
+            },
+            Case {
+                // A button inside a sheet. The sheet keeps the parent window
+                // from being key, but the press must still run (#4392/#4507)
+                // and must not go through any other window's responder chain.
+                name: "click_ax_press_sheet_button",
+                mode: "sheet",
+                keys: Keys::Forbidden,
+                run: |ctx, fixture| {
+                    let token = match element_token(ctx, fixture, "AXButton", Some("Sheet OK")) {
+                        Ok(token) => token,
+                        Err(message) => return setup_failure(message),
+                    };
+                    let mut result = call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "click",
+                        json!({ "element_token": token }),
+                    );
+                    std::thread::sleep(Duration::from_millis(300));
+                    result["sheet_after"] = json!(value_of(fixture, "lbl-sheet-action"));
+                    result
+                },
+                expect: |_, result, view| {
+                    let mut failures = Vec::new();
+                    if is_error(result) {
+                        failures.push(format!("call refused: {}", result_text(result)));
+                    }
+                    let presses = view
+                        .events
+                        .iter()
+                        .filter(|e| e["kind"] == "sheet_action")
+                        .count();
+                    if presses != 1 {
                         failures.push(format!(
-                            "the app's focused window is {:?} after the call, not the main window {}",
-                            ax::focused_window_id_of_pid(fixture.pid),
-                            fixture.main
+                            "expected exactly one sheet button press, got {presses}"
+                        ));
+                    }
+                    failures
+                },
+            },
+            Case {
+                // hotkey with an element token whose combo is a menu key
+                // equivalent: the element is focused and the menu item run
+                // with the window bound, nothing is typed.
+                name: "hotkey_menu_equivalent_with_element",
+                mode: "two-windows",
+                keys: Keys::Forbidden,
+                run: |ctx, fixture| {
+                    let token = match text_input(ctx, fixture) {
+                        Ok(found) => found,
+                        Err(message) => return setup_failure(message),
+                    };
+                    call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "hotkey",
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "keys": ["cmd", "option", "l"] }),
+                    )
+                },
+                expect: |fixture, result, view| {
+                    let mut failures = Vec::new();
+                    if is_error(result) {
+                        failures.push(format!("call refused: {}", result_text(result)));
+                    }
+                    let ran_in_context = view.menu_actions.iter().filter(|a| {
+                        a["is_active"] == Value::Bool(true)
+                            && a["key_window"].as_u64() == Some(u64::from(fixture.main))
+                    });
+                    if view.menu_actions.len() != 1 || ran_in_context.count() != 1 {
+                        failures.push(format!(
+                            "expected exactly one Arrange Left run with the app active and window {} key, got {:?}",
+                            fixture.main, view.menu_actions
+                        ));
+                    }
+                    failures
+                },
+            },
+            Case {
+                // The same menu key equivalent without an element token.
+                name: "hotkey_menu_equivalent_without_element",
+                mode: "two-windows",
+                keys: Keys::Forbidden,
+                run: |ctx, fixture| {
+                    call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "hotkey",
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "keys": ["cmd", "option", "l"] }),
+                    )
+                },
+                expect: |fixture, result, view| {
+                    let mut failures = Vec::new();
+                    if is_error(result) {
+                        failures.push(format!("call refused: {}", result_text(result)));
+                    }
+                    if view.menu_actions.len() != 1 {
+                        failures.push(format!(
+                            "expected exactly one Arrange Left run in window {}, got {:?}",
+                            fixture.main, view.menu_actions
                         ));
                     }
                     failures
                 },
             },
         ]
+    }
+
+    /// The app's focused window is the main window again after a call that
+    /// bound another window.
+    fn focused_window_restored(fixture: &Fixture) -> Vec<String> {
+        let focused = ax::focused_window_id_of_pid(fixture.pid);
+        if focused == Some(fixture.main) {
+            Vec::new()
+        } else {
+            vec![format!(
+                "the app's focused window is {focused:?} after the call, not the main window {}",
+                fixture.main
+            )]
+        }
     }
 
     pub fn run() -> Value {
@@ -852,23 +1007,26 @@ mod native {
             let view = target_view(&fixture);
 
             let mut failures = (case.expect)(&fixture, &result, &view);
+            let mut observations = Vec::new();
             if view.ends_active {
-                failures.push("the target still believes it is active after the call".into());
+                observations
+                    .push("the target still believes it is active after the call".to_owned());
             }
             if view.activations != view.resignations {
-                failures.push(format!(
+                observations.push(format!(
                     "unpaired activation: {} app_active vs {} app_resign_active",
                     view.activations, view.resignations
                 ));
             }
             if !deviations.is_empty() {
-                failures.push(format!(
+                observations.push(format!(
                     "user focus or order changed during the call: {deviations:?}"
                 ));
             }
             if after != launched {
-                failures.push("the user's focus differs after the call".into());
+                observations.push("the user's focus differs after the call".to_owned());
             }
+            failures.append(&mut observations);
             let key_downs: Vec<&Value> = view
                 .events
                 .iter()

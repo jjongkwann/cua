@@ -77,3 +77,50 @@ bounded 45-second lifetime. Wait for that exit before the next run.
 This focused regression supplements, rather than replaces, the complete
 canonical desktop suite described in
 [`test-harnesses-guide.md`](../../../../docs/test-harnesses-guide.md).
+
+# Background focus oracle
+
+`background_focus_oracle` checks that the driver acts on a background AppKit
+app without the user noticing. Each case launches the repository's AppKit
+fixture (`tests/fixtures/apps/macos/appkit`) in the background with its focus
+oracle on (`CUA_APPKIT_FOCUS_ORACLE`), drives it through the in-process tool
+registry, and compares two sides:
+
+- the target's own view, from the fixture's journal: whether AppKit believed
+  it active and which window it believed key and main when the command ran,
+  and whether that belief was handed back afterwards;
+- the user's side, from WindowServer, `NSWorkspace` and Accessibility: the
+  front process, the process holding key focus, the user's focused window and
+  element, and whether a fixture window ever sat above the user's front
+  window, sampled every few milliseconds during the call.
+
+The cases cover a background `invoke_menu` (the requested window, a sibling
+window, an item with no action, a window a sheet keeps from being key), a
+native `AXPress` (a button, and a sheet's own button), the key tools
+(`type_text`, `type_text_chars`, `press_key`, a `hotkey` that sends keys, a
+`press_key` addressed to the sibling window) and the `hotkey` menu-equivalent
+route with and without an element. Nothing in it moves the pointer, raises a
+window or activates an app; raw pixel clicks and drags are not covered.
+
+## Build and run
+
+From `libs/cua-driver`, build the fixture, then run the oracle from the Rust
+workspace in a logged-in Aqua session whose terminal (or its responsible app)
+has Accessibility:
+
+```bash
+bash tests/fixtures/build/macos.sh --only appkit
+cd rust
+cargo test -p platform-macos --test background_focus_oracle -- --run-gui --report /tmp/focus-oracle.json
+```
+
+Without `--run-gui` the binary prints a skip, so plain `cargo test` stays
+hermetic. `CUA_FOCUS_ORACLE_CASE=<name>` runs one case. The report is JSON:
+`passed`, and per case the failures, the call time, the refusal code, the
+fixture's journal and the user's focus before and after.
+
+The oracle runs on a Mac in use, but a user interaction during a case (a
+menu-bar click, a Control Center sample holding key focus) fails that case as
+a focus change; rerun it alone. What the cases established, and what they do
+not, is in
+[`docs/macos-synthetic-focus.md`](../../../../docs/macos-synthetic-focus.md).

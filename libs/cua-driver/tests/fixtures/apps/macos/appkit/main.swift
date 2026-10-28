@@ -662,6 +662,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     @objc private func onReset() {
         counterValue = 0
         counterLabel.stringValue = "counter=0"
+        menuActionLabel.stringValue = "menu_action=none"
         writeTaskState()
     }
 
@@ -829,9 +830,21 @@ final class ClickTargetButton: NSButton {
 
 // Opt-in windows for the persistent exact-window activation certification.
 // Ordinary harness launches remain byte-for-byte and behaviorally unchanged.
+/// The target of the sheet's button: journals the press for the focus oracle
+/// and shows it in the sheet. The sheet stays up, so a second press counts.
+final class SheetButtonTarget: NSObject {
+    let state = NSTextField(labelWithString: "sheet_action=none")
+
+    @objc func onSheetOk(_ sender: NSButton) {
+        state.stringValue = "sheet_action=ok"
+        FocusOracle.shared?.append("sheet_action", ["action": "sheet_ok"])
+    }
+}
+
 final class BringToFrontMatrixWindows {
     let secondary: NSWindow
     var sheet: NSWindow?
+    var sheetTarget: SheetButtonTarget?
     var floating: NSPanel?
 
     init(parent: NSWindow, mode: String) {
@@ -853,7 +866,23 @@ final class BringToFrontMatrixWindows {
                 contentRect: NSRect(x: 0, y: 0, width: 360, height: 160),
                 styleMask: [.titled], backing: .buffered, defer: false)
             candidate.title = kSheetWindowTitle
-            candidate.contentView = NSTextField(labelWithString: "modal sheet blocks parent key status")
+            // A label and a button: the button is what a background AXPress
+            // on a sheet control must still reach (#4392/#4507).
+            let target = SheetButtonTarget()
+            let okButton = NSButton(title: "Sheet OK", target: target, action: #selector(SheetButtonTarget.onSheetOk(_:)))
+            okButton.setAccessibilityIdentifier("btn-sheet-ok")
+            target.state.setAccessibilityIdentifier("lbl-sheet-action")
+            let stack = NSStackView(views: [
+                NSTextField(labelWithString: "modal sheet blocks parent key status"),
+                okButton,
+                target.state,
+            ])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 8
+            stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+            candidate.contentView = stack
+            sheetTarget = target
             sheet = candidate
             parent.beginSheet(candidate)
         } else if mode == "floating" {
@@ -915,11 +944,13 @@ func installMenuBar(target: HarnessWindowController) {
     let windowMenu = NSMenu(title: "Window")
     let arrangeItem = NSMenuItem(title: "Arrange", action: nil, keyEquivalent: "")
     let arrangeMenu = NSMenu(title: "Arrange")
+    // cmd+option+l: a key equivalent for the background hotkey menu route.
     let leftItem = NSMenuItem(
         title: "Left",
         action: #selector(HarnessWindowController.onArrangeLeft(_:)),
-        keyEquivalent: ""
+        keyEquivalent: "l"
     )
+    leftItem.keyEquivalentModifierMask = [.command, .option]
     leftItem.target = target
     leftItem.setAccessibilityIdentifier("menu-window-arrange-left")
     arrangeMenu.addItem(leftItem)
