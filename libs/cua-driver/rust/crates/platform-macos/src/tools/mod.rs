@@ -323,7 +323,7 @@ pub(crate) fn synthetic_focus_refusal(
         Refusal::NotOwned { owner: None, .. } => (refusal_codes::WINDOW_NOT_FOUND, None),
         Refusal::NotOwned { owner: Some(_), .. } => (refusal_codes::OWNER_PID_MISMATCH, None),
         Refusal::Unconfirmed { .. } => (WINDOW_NOT_KEY, Some("foreground")),
-        Refusal::FrontChanged { .. } => (WINDOW_NOT_KEY, None),
+        Refusal::FrontChanged { .. } => (FRONT_CHANGED, None),
     };
     background_refusal_result(
         pid,
@@ -486,6 +486,10 @@ pub(crate) fn keyboard_focus_policy(window_id: Option<u32>, foreground: bool) ->
         _ => FocusPolicy::Suppress,
     }
 }
+
+/// Refusal code when the user's front process changed while a window was
+/// being bound: nothing was dispatched, the call can simply be retried.
+pub(crate) const FRONT_CHANGED: &str = "front_changed";
 
 /// Refusal code when the addressed window cannot be confirmed as the app's
 /// key window: no key is sent, none could be proven to reach it.

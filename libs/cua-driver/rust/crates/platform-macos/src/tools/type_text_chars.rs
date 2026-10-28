@@ -129,6 +129,7 @@ impl Tool for TypeTextCharsTool {
             policy,
             "type_text_chars.CGEvent",
             &mut _mutation_lease,
+            &mut crate::synthetic_focus::Report::default(),
             move || crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms),
         )
         .await;

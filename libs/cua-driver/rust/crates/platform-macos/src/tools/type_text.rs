@@ -379,6 +379,7 @@ impl Tool for TypeTextTool {
             policy,
             "type_text.AXSelectedText",
             &mut _mutation_lease,
+            &mut crate::synthetic_focus::Report::default(),
             move || {
                 let _native_guard = native_guard;
                 type_text_in_key_window(

@@ -54,6 +54,16 @@
 //! window in place, as a foreground key post would, and switches it back
 //! without telling the front app to resign.
 //!
+//! A [`Binding::Key`] request is also confirmed when the window that took key
+//! is a sheet attached to the requested window: AppKit keys the sheet, and a
+//! control pressed in it runs through the sheet's own responder chain.
+//! `KeyMain` and `Keys` stay strict.
+//!
+//! The release re-reads WindowServer's front process before each record and
+//! stops as soon as the target has come to the front. Whether that was the
+//! user (a hardware click or modifier just before) or the target's own
+//! activation is reported; both are left to the reactive layer.
+//!
 //! Every record goes to the target process; nothing is sent to the user's
 //! app. The type-21 key-focus notices are not used here: no path in the
 //! driver removes the target's key focus during a synthetic binding.
@@ -118,6 +128,8 @@ pub struct TargetState {
     /// The window holding `AXFocusedUIElement`. `None` for an app with no
     /// focused element, such as a LibreOffice that has never been active.
     pub element: Option<u32>,
+    /// When `AXFocusedWindow` is an `AXSheet`, the window it is attached to.
+    pub sheet_parent: Option<u32>,
 }
 
 impl TargetState {
@@ -125,7 +137,11 @@ impl TargetState {
         self.frontmost == Some(true)
             && match binding {
                 Binding::Active => true,
-                Binding::Key | Binding::Keys => self.focused == Some(window),
+                // A sheet attached to the requested window takes key in its
+                // place; a control pressed in the sheet runs through the
+                // sheet's responder chain, never another window's.
+                Binding::Key => self.focused == Some(window) || self.sheet_parent == Some(window),
+                Binding::Keys => self.focused == Some(window),
                 Binding::KeyMain => self.focused == Some(window) && self.main == Some(window),
             }
     }
@@ -210,6 +226,19 @@ impl fmt::Display for Refusal {
 
 impl std::error::Error for Refusal {}
 
+/// Who had brought the target to the front by the time the binding was
+/// released, when someone had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrontAtExit {
+    /// A hardware click or modifier change happened just before: the user
+    /// switched to the target.
+    User,
+    /// No hardware input: the action made the target activate itself. The
+    /// reactive layer (`key_focus_guard`, `focus_steal`) hands the front
+    /// back.
+    Target,
+}
+
 /// What the lifecycle did, for results and tests.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
@@ -217,6 +246,9 @@ pub struct Report {
     pub synthetic: bool,
     /// The app's state read back the requested binding.
     pub confirmed: bool,
+    /// The target was the front process when the binding was released, so
+    /// the release stopped and sent no deactivation.
+    pub front_at_exit: Option<FrontAtExit>,
 }
 
 /// The OS, as the lifecycle sees it.
@@ -232,6 +264,8 @@ pub(crate) trait Host {
     fn window_order(&mut self, pid: i32) -> Vec<u32>;
     /// Keep the user's key focus while `pid` may open a menu.
     fn protect_key_focus(&mut self, pid: i32) -> Option<crate::key_focus_guard::Lease>;
+    /// The user pressed a mouse button or a modifier on the hardware just now.
+    fn user_input_recently(&mut self) -> bool;
     fn post_activation(&mut self, pid: i32, window: u32) -> bool;
     fn post_deactivation(&mut self, pid: i32, window: u32) -> bool;
     fn post_make_key(&mut self, pid: i32, window: u32) -> bool;
@@ -270,11 +304,22 @@ impl Host for Live {
                 core_foundation::base::CFRelease(window as _);
                 id
             };
+            // A focused window that is a sheet names the window it is
+            // attached to; `exact_target` maps a sheet to that parent.
+            let sheet_parent = copy_element_attr(app, "AXFocusedWindow").and_then(|window| {
+                let parent = (crate::ax::bindings::copy_string_attr(window, "AXRole").as_deref()
+                    == Some("AXSheet"))
+                .then(|| crate::ax::exact_target::element_window_id(window))
+                .flatten();
+                core_foundation::base::CFRelease(window as _);
+                parent
+            });
             let state = TargetState {
                 frontmost: copy_bool_attr(app, "AXFrontmost"),
                 focused: window_id("AXFocusedWindow"),
                 main: window_id("AXMainWindow"),
                 element: crate::ax::bindings::focused_element_window_id_of_pid(pid),
+                sheet_parent,
             };
             core_foundation::base::CFRelease(app as _);
             state
@@ -287,6 +332,10 @@ impl Host for Live {
 
     fn protect_key_focus(&mut self, pid: i32) -> Option<crate::key_focus_guard::Lease> {
         crate::key_focus_guard::protect(pid)
+    }
+
+    fn user_input_recently(&mut self) -> bool {
+        crate::key_focus_guard::user_switched_recently()
     }
 
     fn post_activation(&mut self, pid: i32, window: u32) -> bool {
@@ -329,7 +378,9 @@ struct Bound {
     pid: i32,
     window: u32,
     binding: Binding,
-    /// The app's focused window before binding.
+    /// The app's focused window before binding, when the binding moved it
+    /// (restored on exit). A press binding a sheet's parent leaves the sheet
+    /// focused and has nothing to restore.
     previous: Option<u32>,
     /// The app's on-screen windows before binding, front to back.
     order_before: Vec<u32>,
@@ -352,6 +403,7 @@ impl Entered {
             Entered::Bound(bound) => Report {
                 synthetic: true,
                 confirmed: bound.confirmed,
+                front_at_exit: None,
             },
         }
     }
@@ -423,6 +475,13 @@ fn enter_with<H: Host>(
         polls += 1;
     }
     bound.confirmed = state.satisfies(window, binding);
+    // Restore only a key window the binding moved. Re-binding a focused
+    // window that did not move (a sheet over the requested window) sends the
+    // make-key pair for a sheet, and that pair moves WindowServer's key focus
+    // to the target (measured on the AppKit fixture).
+    bound.previous = before
+        .focused
+        .filter(|previous| state.focused != Some(*previous));
     // Raw pixel input never required the app to confirm its activation
     // (an app without Accessibility cannot); a key binding is proof or
     // nothing.
@@ -445,20 +504,40 @@ fn enter_with<H: Host>(
     Ok(Entered::Bound(bound))
 }
 
+/// Whether the target has come to the front since it was bound, and who
+/// brought it there. A target bound while in front is not asked.
+fn front_taken<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
+    if bound.in_front || host.front_process() != Some(bound.pid) {
+        return None;
+    }
+    Some(if host.user_input_recently() {
+        FrontAtExit::User
+    } else {
+        FrontAtExit::Target
+    })
+}
+
 /// Hand the activation back: the previous key window first, when the binding
 /// moved it and it still exists, then the deactivation notice. A target that
 /// was in front when bound keeps its activation and only gets its key window
-/// back. Nothing when the target has come to the front since: that is the
-/// user's doing.
-fn exit_bound<H: Host>(host: &mut H, bound: &Bound) {
-    if !bound.in_front && host.front_process() == Some(bound.pid) {
-        tracing::debug!(
-            pid = bound.pid,
-            window = bound.window,
-            "synthetic focus: the target is the front process now; leaving it active"
-        );
-        return;
+/// back. The front process is re-read before every record: once the target
+/// has come to the front, nothing more is sent (a user who just activated it
+/// keeps it active; a target that activated itself is the reactive layer's).
+fn exit_bound<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
+    macro_rules! stop_if_front {
+        () => {
+            if let Some(by) = front_taken(host, bound) {
+                tracing::debug!(
+                    pid = bound.pid,
+                    window = bound.window,
+                    ?by,
+                    "synthetic focus: the target is the front process; release stops here"
+                );
+                return Some(by);
+            }
+        };
     }
+    stop_if_front!();
     let restore = match (bound.binding, bound.previous) {
         (Binding::Active, _) | (_, None) => None,
         (_, Some(previous)) if previous == bound.window => None,
@@ -476,17 +555,37 @@ fn exit_bound<H: Host>(host: &mut H, bound: &Bound) {
             // good unless the app is in front for real.
             host.post_deactivation(bound.pid, bound.window);
             host.settle(RECORD_SETTLE);
+            stop_if_front!();
             host.post_activation(bound.pid, previous);
             host.settle(RECORD_SETTLE);
+            stop_if_front!();
             host.post_make_key(bound.pid, previous);
             if !bound.in_front {
                 host.settle(RECORD_SETTLE);
+                stop_if_front!();
                 host.post_deactivation(bound.pid, previous);
             }
         }
         None if bound.in_front => {}
         None => {
             host.post_deactivation(bound.pid, bound.window);
+        }
+    }
+    None
+}
+
+/// Releases a binding when dropped, so the release runs after the action
+/// whether the action returned or panicked.
+struct Release<'a, H: Host> {
+    host: &'a mut H,
+    bound: Option<Bound>,
+    front_at_exit: &'a mut Option<FrontAtExit>,
+}
+
+impl<H: Host> Drop for Release<'_, H> {
+    fn drop(&mut self) {
+        if let Some(bound) = self.bound.take() {
+            *self.front_at_exit = exit_bound(self.host, &bound);
         }
     }
 }
@@ -505,11 +604,22 @@ pub(crate) fn run_with<H: Host, T, E: From<Refusal>>(
         Ok(entered) => entered,
         Err(refusal) => return (Report::default(), Err(E::from(refusal))),
     };
-    let report = entered.report();
-    let result = f();
-    if let Entered::Bound(bound) = &entered {
-        exit_bound(host, bound);
-    }
+    let mut report = entered.report();
+    let mut front_at_exit = None;
+    let result = {
+        let _release = Release {
+            host,
+            bound: match entered {
+                Entered::Bound(bound) => Some(bound),
+                Entered::Passive(_) => None,
+            },
+            front_at_exit: &mut front_at_exit,
+        };
+        // The release runs when `_release` drops: after `f` returns, or
+        // while its panic unwinds.
+        f()
+    };
+    report.front_at_exit = front_at_exit;
     drop(key_focus);
     (report, result)
 }
@@ -532,7 +642,7 @@ impl TargetFocus {
 impl Drop for TargetFocus {
     fn drop(&mut self) {
         if let Some(Entered::Bound(bound)) = self.entered.take() {
-            exit_bound(&mut Live, &bound);
+            let _ = exit_bound(&mut Live, &bound);
         }
     }
 }
@@ -575,6 +685,10 @@ pub(crate) mod fake {
         pub order: Vec<u32>,
         pub posts_succeed: bool,
         pub connection_invalid: bool,
+        /// A sheet `(sheet, parent)`: the make-key pair for `parent` keys
+        /// the sheet instead, as AppKit does.
+        pub sheet: Option<(u32, u32)>,
+        pub user_input_recently: bool,
     }
 
     impl Script {
@@ -591,12 +705,28 @@ pub(crate) mod fake {
                     focused: Some(main),
                     main: Some(main),
                     element: Some(main),
+                    sheet_parent: None,
                 }]),
                 order: vec![main],
                 posts_succeed: true,
                 connection_invalid: false,
+                sheet: None,
+                user_input_recently: false,
             }
         }
+    }
+
+    /// Blocks a deactivation until a test says go, so the test can observe
+    /// what else is still held while the release runs.
+    pub type Gate = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+    pub fn gate() -> Gate {
+        Arc::new((Mutex::new(false), std::sync::Condvar::new()))
+    }
+
+    pub fn open(gate: &Gate) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
     }
 
     pub struct Fake {
@@ -605,6 +735,8 @@ pub(crate) mod fake {
         /// Follow the records: an activation plus make-key pair binds that
         /// window, a deactivation clears everything.
         pub follow_records: bool,
+        /// When set, every deactivation waits for the gate to open.
+        pub hold_deactivation: Option<Gate>,
         live: TargetState,
     }
 
@@ -615,6 +747,7 @@ pub(crate) mod fake {
                 script,
                 ops: Arc::new(Mutex::new(Vec::new())),
                 follow_records: true,
+                hold_deactivation: None,
                 live,
             }
         }
@@ -657,12 +790,22 @@ pub(crate) mod fake {
         }
 
         fn window_order(&mut self, _pid: i32) -> Vec<u32> {
-            self.script.order.clone()
+            // A sheet is an on-screen layer-0 window of the app, as the live
+            // order lists it.
+            let mut order = self.script.order.clone();
+            if let Some((sheet, _)) = self.script.sheet {
+                order.insert(0, sheet);
+            }
+            order
         }
 
         fn protect_key_focus(&mut self, pid: i32) -> Option<crate::key_focus_guard::Lease> {
             self.record(Op::ProtectKeyFocus(pid));
             None
+        }
+
+        fn user_input_recently(&mut self) -> bool {
+            self.script.user_input_recently
         }
 
         fn post_activation(&mut self, pid: i32, window: u32) -> bool {
@@ -675,6 +818,12 @@ pub(crate) mod fake {
         }
 
         fn post_deactivation(&mut self, pid: i32, window: u32) -> bool {
+            if let Some(gate) = &self.hold_deactivation {
+                let mut open = gate.0.lock().unwrap();
+                while !*open {
+                    open = gate.1.wait(open).unwrap();
+                }
+            }
             self.record(Op::Deactivation(pid, window));
             if self.follow_records {
                 self.live.frontmost = Some(false);
@@ -685,9 +834,20 @@ pub(crate) mod fake {
         fn post_make_key(&mut self, pid: i32, window: u32) -> bool {
             self.record(Op::MakeKey(pid, window));
             if self.follow_records {
-                self.live.focused = Some(window);
-                self.live.main = Some(window);
-                self.live.element = Some(window);
+                match self.script.sheet {
+                    Some((sheet, parent)) if parent == window => {
+                        self.live.focused = Some(sheet);
+                        self.live.main = Some(window);
+                        self.live.element = Some(sheet);
+                        self.live.sheet_parent = Some(parent);
+                    }
+                    _ => {
+                        self.live.focused = Some(window);
+                        self.live.main = Some(window);
+                        self.live.element = Some(window);
+                        self.live.sheet_parent = None;
+                    }
+                }
             }
             self.script.posts_succeed
         }
@@ -737,7 +897,8 @@ mod tests {
             report,
             Report {
                 synthetic: true,
-                confirmed: true
+                confirmed: true,
+                front_at_exit: None,
             }
         );
         assert_eq!(
@@ -766,7 +927,8 @@ mod tests {
             report,
             Report {
                 synthetic: true,
-                confirmed: false
+                confirmed: false,
+                front_at_exit: None,
             }
         );
         assert_eq!(
@@ -800,6 +962,7 @@ mod tests {
                     focused: Some(MAIN),
                     main: Some(MAIN),
                     element: Some(MAIN),
+                    sheet_parent: None,
                 },
             })
         );
@@ -960,6 +1123,7 @@ mod tests {
             focused: Some(MAIN),
             main: Some(MAIN),
             element: Some(MAIN),
+            sheet_parent: None,
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -986,6 +1150,7 @@ mod tests {
             focused: Some(MAIN),
             main: Some(MAIN),
             element: Some(MAIN),
+            sheet_parent: None,
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -1014,6 +1179,7 @@ mod tests {
             focused: Some(MAIN),
             main: Some(MAIN),
             element: None,
+            sheet_parent: None,
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -1064,6 +1230,7 @@ mod tests {
             focused: Some(MAIN),
             main: Some(MAIN),
             element: Some(MAIN),
+            sheet_parent: None,
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -1099,6 +1266,7 @@ mod tests {
             focused: Some(MAIN),
             main: Some(MAIN),
             element: Some(MAIN),
+            sheet_parent: None,
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -1106,6 +1274,128 @@ mod tests {
         assert_eq!(result, Ok("dispatched"));
         assert_eq!(report, Report::default());
         assert_eq!(fake.ops(), vec![Op::ProtectKeyFocus(TARGET), Op::Dispatch]);
+    }
+
+    #[test]
+    fn a_panicking_action_still_releases_the_binding() {
+        let mut fake = Fake::new(Script::background(TARGET, MAIN));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_with(
+                &mut fake,
+                TARGET,
+                MAIN,
+                Binding::KeyMain,
+                || -> Result<(), Refusal> { panic!("the action panicked") },
+            )
+        }));
+        assert!(outcome.is_err(), "the panic propagates");
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::Deactivation(TARGET, MAIN),
+            ],
+            "the deactivation notice goes out while the panic unwinds"
+        );
+    }
+
+    #[test]
+    fn a_user_switch_during_the_restore_stops_the_remaining_records() {
+        let mut script = Script::background(TARGET, MAIN);
+        script.order = vec![MAIN, SIBLING];
+        // Reads: before and after binding (user), at the start of the
+        // release (user), after the first record of the restore (target).
+        script.fronts = [Some(USER), Some(USER), Some(USER), Some(TARGET)].into();
+        script.user_input_recently = true;
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, SIBLING, Binding::KeyMain);
+        assert_eq!(result, Ok("dispatched"));
+        assert_eq!(report.front_at_exit, Some(FrontAtExit::User));
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, SIBLING),
+                Op::MakeKey(TARGET, SIBLING),
+                Op::Dispatch,
+                Op::Deactivation(TARGET, SIBLING),
+            ],
+            "no activation of the previous window, no final deactivation"
+        );
+    }
+
+    #[test]
+    fn the_targets_own_activation_at_exit_is_told_apart_from_the_users() {
+        let mut script = Script::background(TARGET, MAIN);
+        script.fronts = [Some(USER), Some(USER), Some(TARGET)].into();
+        script.user_input_recently = false;
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, MAIN, Binding::Key);
+        assert_eq!(result, Ok("dispatched"));
+        assert_eq!(report.front_at_exit, Some(FrontAtExit::Target));
+        assert_eq!(
+            fake.ops().last(),
+            Some(&Op::Dispatch),
+            "a target that activated itself is left to the reactive layer: {:?}",
+            fake.ops()
+        );
+    }
+
+    #[test]
+    fn a_press_binding_accepts_the_requested_windows_sheet() {
+        const SHEET: u32 = 777;
+        let mut script = Script::background(TARGET, MAIN);
+        script.sheet = Some((SHEET, MAIN));
+        // Before the call the sheet is the app's focused window (fact 6).
+        script.states = [TargetState {
+            frontmost: Some(false),
+            focused: Some(SHEET),
+            main: Some(MAIN),
+            element: Some(SHEET),
+            sheet_parent: Some(MAIN),
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, MAIN, Binding::Key);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.confirmed);
+        // The sheet stayed focused, so there is no key window to restore:
+        // no activation naming the sheet, no make-key pair for it.
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::Dispatch,
+                Op::Deactivation(TARGET, MAIN),
+            ]
+        );
+        // The document menu context and posted keys stay strict: a sheet
+        // that took key is not the requested window. (With the sheet already
+        // focused, keys do not route to the requested window either, so the
+        // Keys binding is attempted and refused the same way.)
+        for binding in [Binding::KeyMain, Binding::Keys] {
+            let mut script = Script::background(TARGET, MAIN);
+            script.sheet = Some((SHEET, MAIN));
+            script.states = [TargetState {
+                frontmost: Some(false),
+                focused: Some(SHEET),
+                main: Some(MAIN),
+                element: Some(SHEET),
+                sheet_parent: Some(MAIN),
+            }]
+            .into();
+            let mut fake = Fake::new(script);
+            let (_, result) = run(&mut fake, MAIN, binding);
+            assert!(
+                matches!(result, Err(Refusal::Unconfirmed { .. })),
+                "{binding:?}: {result:?}"
+            );
+            assert!(!fake.ops().contains(&Op::Dispatch));
+        }
     }
 
     #[test]
@@ -1127,7 +1417,16 @@ mod tests {
             focused: Some(MAIN),
             main: Some(SIBLING),
             element: None,
+            sheet_parent: None,
         };
+        let sheet_keyed = TargetState {
+            focused: Some(777),
+            sheet_parent: Some(MAIN),
+            ..bound
+        };
+        assert!(sheet_keyed.satisfies(MAIN, Binding::Key));
+        assert!(!sheet_keyed.satisfies(MAIN, Binding::Keys));
+        assert!(!sheet_keyed.satisfies(MAIN, Binding::KeyMain));
         assert!(bound.satisfies(MAIN, Binding::Active));
         assert!(bound.satisfies(MAIN, Binding::Key));
         assert!(bound.satisfies(MAIN, Binding::Keys));

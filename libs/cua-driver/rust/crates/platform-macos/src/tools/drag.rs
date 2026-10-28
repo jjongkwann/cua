@@ -304,6 +304,29 @@ impl Tool for DragTool {
                 Err(refusal) => return refusal,
             };
 
+        // ── Exact-target background gate (macOS background input v1) ──
+        // A window-addressed background gesture targets coordinates that only
+        // mean something while the exact window is current and not
+        // minimized/hidden, and its binding must not interleave with another
+        // background action on the same process: hold the per-PID mutation
+        // lease, as the pixel click does, from here through the release.
+        let mutation_lease_held = crate::background_mutation::held_by_current_task(pid);
+        let mut _mutation_lease = if !fg && !mutation_lease_held {
+            match super::gate_background_window_action(
+                pid,
+                wid,
+                None,
+                cua_driver_core::background_input::BackgroundAction::WindowPointer,
+            )
+            .await
+            {
+                Ok(lease) => Some(lease),
+                Err(refusal_result) => return refusal_result,
+            }
+        } else {
+            None
+        };
+
         // A toolkit that reads the hardware pointer (Tk) or drops routed
         // mouse events (LibreOffice VCL) cannot take a background gesture;
         // refuse before any activation or dispatch.
@@ -465,20 +488,19 @@ impl Tool for DragTool {
             Ok(session)
         };
         let (result, focus) = match policy {
-            FocusPolicy::Synthetic { window_id, binding } => {
-                match focus_guard::with_synthetic_focus(
+            FocusPolicy::Synthetic { .. } => {
+                let mut focus = Report::default();
+                let result = focus_guard::run_blocking_under(
                     pid,
-                    window_id,
-                    binding,
+                    prior_front,
+                    policy,
                     "drag.CGEvent",
-                    None,
+                    &mut _mutation_lease,
+                    &mut focus,
                     drag,
                 )
-                .await
-                {
-                    Ok(guarded) => (Ok(guarded.result), guarded.focus),
-                    Err(error) => (Err(error), Report::default()),
-                }
+                .await;
+                (result, focus)
             }
             _ => (
                 focus_guard::with_focus_suppressed(
@@ -574,9 +596,14 @@ impl Tool for DragTool {
             })),
             Ok(Err(e))
                 if e.downcast_ref::<crate::synthetic_focus::Refusal>()
-                    == Some(&crate::synthetic_focus::Refusal::WindowServerConnection) =>
+                    .is_some() =>
             {
-                super::windowserver_connection_refusal(pid, Some(wid))
+                super::synthetic_focus_refusal(
+                    pid,
+                    wid,
+                    e.downcast_ref::<crate::synthetic_focus::Refusal>()
+                        .expect("checked"),
+                )
             }
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),

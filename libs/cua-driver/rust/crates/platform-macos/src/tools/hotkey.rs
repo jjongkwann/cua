@@ -319,24 +319,20 @@ impl Tool for HotkeyTool {
                     // run_in_background binds the addressed window as the
                     // app's key and main window, confirmed, or refuses
                     // (window_not_key): it never acts on another window
-                    // (CUA-1767).
-                    if let Some(ptr) = element_ptr {
-                        // The menu command acts on the focused element.
-                        let focused =
-                            tokio::task::spawn_blocking(move || focus_hotkey_element(pid, ptr))
-                                .await;
-                        if !matches!(focused, Ok(Ok(()))) {
-                            return ToolResult::error(
-                                "hotkey: the requested element did not take focus, so its menu \
-                                 command was not run.",
-                            );
-                        }
-                    }
+                    // (CUA-1767). The command acts on the focused element,
+                    // so run_in_background focuses the element under the
+                    // same lease before the binding (a focus written while
+                    // the app believes it is active raises its window) and
+                    // reads the focus back inside the binding, in the state
+                    // the command runs in.
+                    let focus = element_ptr
+                        .map(|element_ptr| super::invoke_menu::ElementFocus { element_ptr });
                     let menu_result = super::invoke_menu::run_in_background(
                         pid,
                         wid,
                         item.path,
                         super::invoke_menu::MenuRequest::KeyEquivalent(key_display.clone()),
+                        focus,
                     )
                     .await;
                     // Only unavailable background menus may fall back to keys;
@@ -528,6 +524,7 @@ impl Tool for HotkeyTool {
             policy,
             "hotkey.CGEvent",
             &mut _mutation_lease,
+            &mut crate::synthetic_focus::Report::default(),
             move || {
                 let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();

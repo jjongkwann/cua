@@ -25,7 +25,8 @@ use crate::ax::bindings::{
     copy_element_attr, copy_string_attr, kAXErrorSuccess, perform_action, set_bool_attr_true,
     AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
-use crate::synthetic_focus::{Binding, Refusal};
+use crate::focus_guard::FocusPolicy;
+use crate::synthetic_focus::{Binding, Refusal, Report};
 
 pub struct InvokeMenuTool;
 
@@ -571,8 +572,9 @@ enum BackgroundPressError {
         focused: Option<u32>,
         main: Option<u32>,
     },
-    /// The daemon has no valid WindowServer connection.
-    Connection,
+    /// The window could not be bound for another reason (it is not the
+    /// pid's, the front app changed, the WindowServer connection is invalid).
+    Focus(Refusal),
 }
 
 impl From<Refusal> for BackgroundPressError {
@@ -583,9 +585,37 @@ impl From<Refusal> for BackgroundPressError {
                 focused: state.focused,
                 main: state.main,
             },
-            Refusal::WindowServerConnection => BackgroundPressError::Connection,
-            other => BackgroundPressError::Other(format!("invoke_menu: {other}")),
+            other => BackgroundPressError::Focus(other),
         }
+    }
+}
+
+/// A step the caller runs with the window bound, before the path is
+/// resolved: the hotkey route focuses its element here. `Err` is the reason
+/// the command was not run.
+/// The element a key-equivalent menu command acts on. Its focus is written
+/// before the binding, while the app is inactive, and read back inside the
+/// binding, in the state the command runs in. Written while the app believes
+/// it is active, the focus orders the element's window above the user's
+/// front window (measured on the AppKit fixture).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ElementFocus {
+    pub element_ptr: usize,
+}
+
+const ELEMENT_FOCUS_READBACK: Duration = Duration::from_millis(200);
+const ELEMENT_FOCUS_POLL: Duration = Duration::from_millis(10);
+
+fn await_element_focused(pid: i32, element_ptr: usize) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + ELEMENT_FOCUS_READBACK;
+    loop {
+        if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("the app's focused element is not the requested one".to_owned());
+        }
+        std::thread::sleep(ELEMENT_FOCUS_POLL);
     }
 }
 
@@ -604,10 +634,13 @@ unsafe fn item_is_save(item: AXUIElementRef) -> bool {
 }
 
 /// How long a disabled item gets to enable after its window was bound as the
-/// app's key window, and how often it is re-read. AppKit validates the item
-/// when it is read; the first read can still see the state from before the
-/// binding.
-const ENABLE_WAIT: Duration = Duration::from_millis(600);
+/// app's key window, and how often it is re-read. AppKit re-validates the
+/// item on a schedule of its own: measured on the fixture, Arrange Left
+/// enabled within 400 ms after a bare binding, within about 1 s when one of
+/// its attributes had been read through accessibility just before, and not
+/// within 600 ms after the hotkey route had read the whole menu bar for a key
+/// equivalent.
+const ENABLE_WAIT: Duration = Duration::from_millis(2000);
 const ENABLE_POLL: Duration = Duration::from_millis(40);
 
 /// Whether `item` is enabled, giving it [`ENABLE_WAIT`] to re-validate.
@@ -806,8 +839,24 @@ pub(super) async fn run_in_background(
     window_id: u32,
     path: Vec<String>,
     request: MenuRequest,
+    focus: Option<ElementFocus>,
 ) -> ToolResult {
-    let lease = super::acquire_background_mutation(pid).await;
+    let mut lease = Some(super::acquire_background_mutation(pid).await);
+    if let Some(ElementFocus { element_ptr }) = focus {
+        let written = tokio::task::spawn_blocking(move || {
+            crate::input::ax_actions::focus_element(element_ptr)
+        })
+        .await;
+        if let Err(error) = written
+            .map_err(|e| e.to_string())
+            .and_then(|r| r.map_err(|e| e.to_string()))
+        {
+            return refusal(format!(
+                "hotkey: the requested element could not be focused ({error}), so its menu \
+                 command was not run"
+            ));
+        }
+    }
     let document = tokio::task::spawn_blocking(move || document_path_of_window(pid, window_id))
         .await
         .ok()
@@ -816,17 +865,34 @@ pub(super) async fn run_in_background(
         .as_deref()
         .and_then(crate::apple_events::modified_time);
     let press_path = path.clone();
-    let guarded = crate::focus_guard::with_synthetic_focus(
+    let prior_front = crate::apps::frontmost_pid();
+    let outcome = crate::focus_guard::run_blocking_under(
         pid,
-        window_id,
-        Binding::KeyMain,
+        prior_front,
+        FocusPolicy::Synthetic {
+            window_id,
+            binding: Binding::KeyMain,
+        },
         "invoke_menu.background",
-        Some(lease),
-        move || unsafe { invoke_path_in_background(pid, window_id, &press_path) },
+        &mut lease,
+        &mut Report::default(),
+        move || {
+            if let Some(ElementFocus { element_ptr }) = focus {
+                await_element_focused(pid, element_ptr).map_err(|reason| {
+                    BackgroundPressError::Other(format!(
+                        "hotkey: the requested element did not take focus ({reason}), so its \
+                         menu command was not run"
+                    ))
+                })?;
+            }
+            unsafe { invoke_path_in_background(pid, window_id, &press_path) }
+        },
     )
     .await;
-    let (_mutation, outcome) = match guarded {
-        Ok(guarded) => (guarded.lease, guarded.result),
+    // Held through the postcondition checks below.
+    let _mutation = lease;
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
         Err(error) => return refusal(format!("invoke_menu: blocking task failed: {error}")),
     };
     let preface = request.preface(&path);
@@ -932,8 +998,8 @@ pub(super) async fn run_in_background(
             focused,
             main,
         }) => unbound_menu_window(pid, requested, focused, main),
-        Err(BackgroundPressError::Connection) => {
-            super::windowserver_connection_refusal(pid, Some(window_id))
+        Err(BackgroundPressError::Focus(refusal)) => {
+            super::synthetic_focus_refusal(pid, window_id, &refusal)
         }
         Err(BackgroundPressError::Other(error)) => refusal(error),
     }
@@ -1015,7 +1081,7 @@ impl Tool for InvokeMenuTool {
         .await
         .unwrap_or(false);
         if !target_in_front {
-            return run_in_background(pid, window_id, path, MenuRequest::Path).await;
+            return run_in_background(pid, window_id, path, MenuRequest::Path, None).await;
         }
 
         let outcome = tokio::task::spawn_blocking(move || {
@@ -1103,6 +1169,7 @@ mod tests {
                 focused: Some(8),
                 main: Some(7),
                 element: Some(8),
+                sheet_parent: None,
             },
         };
         assert!(matches!(
@@ -1115,7 +1182,14 @@ mod tests {
         ));
         assert!(matches!(
             BackgroundPressError::from(Refusal::WindowServerConnection),
-            BackgroundPressError::Connection
+            BackgroundPressError::Focus(Refusal::WindowServerConnection)
+        ));
+        assert!(matches!(
+            BackgroundPressError::from(Refusal::FrontChanged {
+                before: Some(1),
+                after: Some(2)
+            }),
+            BackgroundPressError::Focus(Refusal::FrontChanged { .. })
         ));
     }
 

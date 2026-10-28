@@ -442,6 +442,7 @@ impl Tool for PressKeyTool {
             policy,
             "press_key.CGEvent",
             &mut _mutation_lease,
+            &mut crate::synthetic_focus::Report::default(),
             move || {
                 let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();

@@ -18,10 +18,16 @@
 //!    the user's app.
 //!
 //! [`FocusPolicy`] decides, for one action, which window snapshot (and so
-//! which wildcard suppression) is taken and whether layer 2 applies, so the
-//! three never disagree: a synthetic binding is never undone by the reactive
-//! layer as a theft, and a plain AX action never leaves the target believing
-//! it is active.
+//! which wildcard suppression) is taken, whether the target's own activation
+//! is suppressed, and whether layer 2 applies, so the three never disagree.
+//! NSWorkspace does not report a synthetic activation (measured with the
+//! fixture oracle: `frontmostApplication` never named the target during a
+//! bound action), so the reactive layer only ever sees a real activation.
+//! Key, key-and-main and key-routing bindings therefore keep suppressing the
+//! target's real self-activation, as every AX action did before; raw pixel
+//! input (`Active`) keeps its earlier allowance, since the click itself may
+//! legitimately activate the app and `restore_user_focus_after_background_pixel`
+//! hands the front back.
 //!
 //! ## Two wrappers
 //!
@@ -60,28 +66,48 @@ pub enum FocusPolicy {
     Foreground,
 }
 
+/// The wildcard suppression a policy's window snapshot arms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Suppression {
+    /// Any app that takes the front, the target included, is restored.
+    Wildcard,
+    /// Any app but the target.
+    AllowingTarget,
+    /// None: the caller fronts and restores itself.
+    None,
+}
+
 impl FocusPolicy {
-    /// The window snapshot (and wildcard suppression) matching this policy,
-    /// to take before the action and detect after it.
-    pub fn snapshot(self, prior_front: Option<i32>, pid: i32) -> Snapshot {
+    /// The wildcard suppression this policy's snapshot arms.
+    pub fn suppression(self) -> Suppression {
         match self {
-            FocusPolicy::Suppress => WindowChangeDetector::snapshot(prior_front),
-            // NSWorkspace can report a synthetically active target as the
-            // active app; the reactive layer must not undo that binding, only
-            // an activation of some other app.
-            FocusPolicy::Synthetic { .. } => {
-                WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
-            }
-            FocusPolicy::Foreground => {
-                WindowChangeDetector::snapshot_without_suppression(prior_front)
-            }
+            FocusPolicy::Suppress => Suppression::Wildcard,
+            FocusPolicy::Synthetic {
+                binding: Binding::Active,
+                ..
+            } => Suppression::AllowingTarget,
+            FocusPolicy::Synthetic { .. } => Suppression::Wildcard,
+            FocusPolicy::Foreground => Suppression::None,
         }
     }
 
-    /// The pid [`with_focus_suppressed`] arms its targeted lease for under
-    /// this policy: only a plain background AX action suppresses the target.
+    /// The window snapshot (and wildcard suppression) matching this policy,
+    /// to take before the action and detect after it.
+    pub fn snapshot(self, prior_front: Option<i32>, pid: i32) -> Snapshot {
+        match self.suppression() {
+            Suppression::Wildcard => WindowChangeDetector::snapshot(prior_front),
+            Suppression::AllowingTarget => {
+                WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
+            }
+            Suppression::None => WindowChangeDetector::snapshot_without_suppression(prior_front),
+        }
+    }
+
+    /// The pid whose real self-activation a targeted lease restores under
+    /// this policy: the target, except for raw pixel input and foreground
+    /// delivery.
     pub fn suppressed_target(self, pid: i32) -> Option<i32> {
-        matches!(self, FocusPolicy::Suppress).then_some(pid)
+        matches!(self.suppression(), Suppression::Wildcard).then_some(pid)
     }
 }
 
@@ -273,26 +299,39 @@ where
 
 /// Run the blocking action `f` on `pid` under `policy`: with the window
 /// bound through [`with_synthetic_focus`] (the lease moves onto the blocking
-/// thread and comes back through `lease`), or on a blocking thread under
-/// [`with_focus_suppressed`]. A refused binding comes back as
-/// `Ok(Err(refusal))`, the action not run; callers turn it into the tool's
-/// structured refusal.
-pub(crate) async fn run_blocking_under<T>(
+/// thread and comes back through `lease`, and the target's real
+/// self-activation stays suppressed where the policy says so), or on a
+/// blocking thread under [`with_focus_suppressed`]. A refused binding comes
+/// back as `Ok(Err(refusal))`, the action not run; callers turn it into the
+/// tool's structured refusal. `report` receives what the binding did.
+pub(crate) async fn run_blocking_under<T, E>(
     pid: i32,
     prior_front: Option<i32>,
     policy: FocusPolicy,
     origin: &'static str,
     lease: &mut Option<BackgroundMutationLease>,
-    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
-) -> Result<anyhow::Result<T>, tokio::task::JoinError>
+    report: &mut Report,
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<Result<T, E>, tokio::task::JoinError>
 where
     T: Send + 'static,
+    E: From<Refusal> + Send + 'static,
 {
     match policy {
         FocusPolicy::Synthetic { window_id, binding } => {
+            let targeted = match (policy.suppressed_target(pid), prior_front) {
+                (Some(target), Some(prior)) if prior != target => {
+                    Some(focus_steal::begin_suppression(Some(target), prior, origin))
+                }
+                _ => None,
+            };
             let guarded =
                 with_synthetic_focus(pid, window_id, binding, origin, lease.take(), f).await?;
             *lease = guarded.lease;
+            *report = guarded.focus;
+            if targeted.is_some() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             Ok(guarded.result)
         }
         FocusPolicy::Suppress | FocusPolicy::Foreground => {
@@ -412,15 +451,88 @@ mod tests {
 
     #[test]
     fn the_policy_decides_suppression_and_snapshot_together() {
-        assert_eq!(FocusPolicy::Suppress.suppressed_target(7), Some(7));
+        let synthetic = |binding| FocusPolicy::Synthetic {
+            window_id: 1,
+            binding,
+        };
+        // A plain AX action and every key binding suppress the target's own
+        // activation with a wildcard snapshot.
+        for policy in [
+            FocusPolicy::Suppress,
+            synthetic(Binding::Key),
+            synthetic(Binding::KeyMain),
+            synthetic(Binding::Keys),
+        ] {
+            assert_eq!(policy.suppression(), Suppression::Wildcard, "{policy:?}");
+            assert_eq!(policy.suppressed_target(7), Some(7), "{policy:?}");
+        }
+        // Raw pixel input lets the target activate; foreground delivery
+        // suppresses nothing.
         assert_eq!(
-            FocusPolicy::Synthetic {
-                window_id: 1,
-                binding: Binding::Active
-            }
-            .suppressed_target(7),
-            None
+            synthetic(Binding::Active).suppression(),
+            Suppression::AllowingTarget
         );
+        assert_eq!(synthetic(Binding::Active).suppressed_target(7), None);
+        assert_eq!(FocusPolicy::Foreground.suppression(), Suppression::None);
         assert_eq!(FocusPolicy::Foreground.suppressed_target(7), None);
+    }
+
+    #[tokio::test]
+    async fn the_lease_is_released_only_after_the_binding() {
+        let mut fake = Fake::new(Script::background(TARGET - 2, WINDOW));
+        let gate = crate::synthetic_focus::fake::gate();
+        fake.hold_deactivation = Some(gate.clone());
+        let ops = fake.ops.clone();
+        let lease = crate::tools::acquire_background_mutation(TARGET - 2).await;
+        let action = tokio::spawn(with_synthetic_focus_on(
+            fake,
+            TARGET - 2,
+            WINDOW,
+            Binding::Key,
+            "test",
+            Some(lease),
+            move || Ok::<_, Refusal>(()),
+        ));
+        // The release is blocked in its deactivation notice; the action has
+        // run, and the lease must still be held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !ops
+            .lock()
+            .unwrap()
+            .contains(&Op::MakeKey(TARGET - 2, WINDOW))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the binding never ran"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                crate::tools::acquire_background_mutation(TARGET - 2)
+            )
+            .await
+            .is_err(),
+            "the lease must stay held while the release is still running"
+        );
+        crate::synthetic_focus::fake::open(&gate);
+        let guarded = tokio::time::timeout(Duration::from_secs(2), action)
+            .await
+            .expect("the action finishes once the release may proceed")
+            .expect("the task does not panic")
+            .expect("the blocking task does not panic");
+        assert!(guarded.result.is_ok());
+        drop(guarded);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::tools::acquire_background_mutation(TARGET - 2),
+        )
+        .await
+        .expect("the lease is released once the release has finished");
+        assert_eq!(
+            ops.lock().unwrap().last(),
+            Some(&Op::Deactivation(TARGET - 2, WINDOW))
+        );
     }
 }

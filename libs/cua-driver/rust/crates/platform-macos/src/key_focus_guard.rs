@@ -205,7 +205,7 @@ extern "C" {
 
 /// Whether the user pressed a mouse button or a modifier key on the real
 /// hardware just now. Events the driver posts to a pid do not count.
-fn user_switched_recently() -> bool {
+pub(crate) fn user_switched_recently() -> bool {
     const HID_SYSTEM_STATE: i32 = 1;
     const LEFT_MOUSE_DOWN: u32 = 1;
     const RIGHT_MOUSE_DOWN: u32 = 3;

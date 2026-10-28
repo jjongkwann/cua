@@ -845,13 +845,20 @@ impl Tool for ClickTool {
             let selection_modifiers = modifiers.clone();
             let result: Result<Result<(AxClickOutcome, bool), ClickError>, tokio::task::JoinError> =
                 match policy {
-                    FocusPolicy::Synthetic { window_id, binding } => {
-                        let guarded = focus_guard::with_synthetic_focus(
+                    FocusPolicy::Synthetic { .. } => {
+                        let unbound = (
+                            element_guard.clone(),
+                            action_clone.clone(),
+                            ck.clone(),
+                            selection_modifiers.clone(),
+                        );
+                        let bound = focus_guard::run_blocking_under(
                             pid,
-                            window_id,
-                            binding,
+                            prior_front,
+                            policy,
                             "click.AXPress",
-                            _mutation_lease.take(),
+                            &mut _mutation_lease,
+                            &mut Report::default(),
                             move || {
                                 perform_ax_click(
                                     (element_guard.as_ptr(), idx),
@@ -867,12 +874,50 @@ impl Tool for ClickTool {
                             },
                         )
                         .await;
-                        match guarded {
-                            Ok(guarded) => {
-                                _mutation_lease = guarded.lease;
-                                Ok(guarded.result)
+                        match bound {
+                            // The window could not be made the app's key
+                            // window (a window that cannot become key, or
+                            // another window of the app holds key). Press
+                            // anyway with the app released, as before the
+                            // binding existed (#4392/#4507): the element is
+                            // exact, and with no key or main window a
+                            // nil-targeted action has no responder chain that
+                            // could reach another window.
+                            Ok(Err(ClickError::Focus(Refusal::Unconfirmed { .. }))) => {
+                                let (element_guard, action_clone, ck, selection_modifiers) =
+                                    unbound;
+                                focus_guard::with_focus_suppressed(
+                                    Some(pid),
+                                    prior_front,
+                                    "click.AXPress.unbound",
+                                    || async move {
+                                        tokio::task::spawn_blocking(move || {
+                                            perform_ax_click(
+                                                (element_guard.as_ptr(), idx),
+                                                (pid, wid),
+                                                &action_clone,
+                                                &ck,
+                                                selection_pixel,
+                                                &selection_modifiers,
+                                                false,
+                                            )
+                                            .map(|(mut summary, a, b, c, d)| {
+                                                summary.push_str(
+                                                    " The window could not be made the app's \
+                                                     key window, so the press ran with the app \
+                                                     inactive; a control that acts on the key \
+                                                     window's first responder did nothing.",
+                                                );
+                                                ((summary, a, b, c, d), false)
+                                            })
+                                            .map_err(ClickError::Action)
+                                        })
+                                        .await
+                                    },
+                                )
+                                .await
                             }
-                            Err(error) => Err(error),
+                            other => other,
                         }
                     }
                     _ => focus_guard::with_focus_suppressed(
@@ -1433,23 +1478,19 @@ impl Tool for ClickTool {
             let (result, focus) = match policy {
                 // The target is synthetically active for the click and told
                 // to resign afterwards, all on the blocking thread.
-                FocusPolicy::Synthetic { window_id, binding } => {
-                    match focus_guard::with_synthetic_focus(
+                FocusPolicy::Synthetic { .. } => {
+                    let mut focus = Report::default();
+                    let result = focus_guard::run_blocking_under(
                         pid,
-                        window_id,
-                        binding,
+                        prior_front,
+                        policy,
                         "click.pixel",
-                        _mutation_lease.take(),
+                        &mut _mutation_lease,
+                        &mut focus,
                         do_click,
                     )
-                    .await
-                    {
-                        Ok(guarded) => {
-                            _mutation_lease = guarded.lease;
-                            (Ok(guarded.result), guarded.focus)
-                        }
-                        Err(error) => (Err(error), Report::default()),
-                    }
+                    .await;
+                    (result, focus)
                 }
                 _ => (
                     focus_guard::with_focus_suppressed(
@@ -1520,10 +1561,12 @@ impl Tool for ClickTool {
                         "focus_without_raise": focus.synthetic
                     }))
                 }
-                Ok(Err(e))
-                    if e.downcast_ref::<Refusal>() == Some(&Refusal::WindowServerConnection) =>
-                {
-                    super::windowserver_connection_refusal(pid, window_id)
+                Ok(Err(e)) if e.downcast_ref::<Refusal>().is_some() && window_id.is_some() => {
+                    super::synthetic_focus_refusal(
+                        pid,
+                        window_id.unwrap_or_default(),
+                        e.downcast_ref::<Refusal>().expect("checked"),
+                    )
                 }
                 Ok(Err(e)) if route == PixelClickRoute::ForegroundHid => {
                     super::pixel_route::foreground_unavailable(
