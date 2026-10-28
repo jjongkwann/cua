@@ -59,8 +59,8 @@ sent; each was sent on its own and in sequences, several runs each, on macOS
    step; three repeats with the same steps did not reproduce it, and the
    process that had been in front no longer existed, so it is taken as the
    user switching apps.
-8. Key events posted to the process with the window in their routing fields
-   (`type_text`, `type_text_chars`, `press_key`, a shift+m `hotkey`) reached
+8. Key events posted to the process, which carry no window
+   (`type_text`, `type_text_chars`, `press_key`, a shift+m `hotkey`), reached
    the fixture's text field while the fixture was inactive and had no key
    window: the journal shows each key-down in the main window with the field
    editor (`NSTextView`) as responder, `is_active=false`, `key_window=0`, and
@@ -131,17 +131,19 @@ with no key window (`background_focus_oracle` against ded0c1748).
   driver path removes the target's key focus during a synthetic binding, so
   it is not sent. If a future path does, `key_focus_guard` is where the
   removal is seen.
-- Posted keys reach the app's focused window: AppKit routes them by the
-  window in the event, VCL (LibreOffice) to its focused window and nowhere
-  while it has no focused element (CUA-1767). `AXFocusedWindow` plus a focused
-  element is therefore taken as "the window already routes keys", the
-  predictor the earlier primer used; it was measured on LibreOffice and seen
-  on AppKit (fact 8), not on other toolkits.
+- Posted keys reach the app's focused window: AppKit delivered them to that
+  window's first responder (fact 8; the events name no window), VCL
+  (LibreOffice) to its focused window and nowhere while it has no focused
+  element (CUA-1767). `AXFocusedWindow` holding the focused element is
+  therefore taken as "the window already routes keys", the earlier primer's
+  predictor narrowed to the element's window; it was measured on LibreOffice
+  and seen on AppKit with one key window, not on other toolkits or on an app
+  whose last key window (a panel) differs from its main window.
 - Focusing an element in a sibling window S while the app is inactive and
   has its main window M focused: whether `AXFocusedUIElement` then names S's
   element was not measured (the fixture's sibling window has no editable
-  control). The hotkey menu route reads the focus back inside the binding and
-  refuses when it is not the requested element, rather than assuming either.
+  control). Both hotkey routes read the focus back inside the binding and
+  refuse when it is not the requested element, rather than assuming either.
 
 ## Implementation choices
 
@@ -183,7 +185,8 @@ with no key window (`background_focus_oracle` against ded0c1748).
 - Callers: `invoke_menu` background (`KeyMain`, both exact focused/main
   checks kept); `hotkey`'s menu-equivalent route (through `invoke_menu`, which
   focuses the requested element under the same lease before the binding and
-  reads the focus back inside it, fact 11); a background `AXPress` in a
+  reads the focus back inside it, fact 11) and its key route, which does the
+  same around its `Keys` binding; a background `AXPress` in a
   native app (`Key`; a window that cannot be made key is pressed unbound, with
   the app inactive, and the result says a control that acts on the key
   window's first responder did nothing); a background left pixel `click` and
@@ -192,15 +195,32 @@ with no key window (`background_focus_oracle` against ded0c1748).
   `set_value` type-ahead) with `Keys`. The ad-hoc primers and the earlier
   key-window scope (`WindowKeyScope`, `prime_exact_window_key`, `key_scope`,
   `leave_to_owner`) are removed.
-- `Keys` sends nothing when the window already routes keys (fact 8 and the
-  hypothesis above), so the common background key post stays record-free, as
-  it was; otherwise it binds as `Key` does and refuses unconfirmed
-  (`window_not_key`). The earlier primer's `AXFocusedWindow` write fallback is
-  gone: that write does not make a window key, and a binding that only it
-  could satisfy was never proven to route keys. For a target the user has in
-  front, `Keys` switches the app's key window in place (deactivation notice,
-  activation notice naming the window, pair), as the earlier primer did, and
-  switches it back without telling the front app to resign.
+- `Keys` sends nothing when the window is the app's focused window and holds
+  its focused element (fact 8 and the hypothesis above), so the common
+  background key post stays record-free, as it was. A focused element in
+  another window (a panel's field, or the modeless dialog field VCL keeps
+  reporting) does not count: the window is bound. Otherwise it binds as `Key`
+  does, with the steps the earlier primer had measured on LibreOffice: the
+  readback waits, within its 400 ms, for the window to hold the focused
+  element as well (a LibreOffice that has never been active shows it last and
+  drops keys until then), then decides on the focused window; an unconfirmed
+  binding gets its records a second time (deactivation, activation, pair: they
+  arrive asynchronously and the app can still be handling the first); and an
+  app that still has no focused element gets an `AXFocusedWindow` write as the
+  last step, confirmed when the window reads back as the focused one, the
+  route VCL was measured to follow. An app with a focused element that
+  ignores both passes is refused (`window_not_key`). The exit restores a
+  window the binding moved with the records, after a write too (the earlier
+  primer restored with another write).
+- For a target the user has in front, `Keys` switches the app's key window in
+  place (deactivation notice, activation notice naming the window, pair), as
+  the earlier primer did, and switches it back without telling the front app
+  to resign. Two exceptions at exit: a target that is no longer WindowServer's
+  front process by the end of the release (the user switched away during the
+  call) gets the final deactivation, so it is not left believing it is active
+  in the background; and when the user moved the app's key window to another
+  of its windows during a confirmed switch, that window stays key and the
+  previous one is not restored over it.
 - The key tools run their key post on the blocking thread that holds the
   binding and the per-PID lease (`focus_guard::run_blocking_under`), so a
   dropped caller future still releases the binding after the keys. A key
@@ -225,7 +245,11 @@ with no key window (`background_focus_oracle` against ded0c1748).
   order, panic release, the per-record front check stopping a restore, user
   versus target at exit, sheet acceptance with no sheet restore, checked by
   reverting the fix and watching the test fail, sibling restore, the lease
-  released only after the binding; focus_guard: suppression per policy;
+  released only after the binding, the `Keys` readback (element wait, second
+  pass, the `AXFocusedWindow` write only without a focused element), the
+  in-place switch ending resigned when the user leaves and keeping a key
+  window the user picked, each checked by breaking it; focus_guard:
+  suppression per policy;
   invoke_menu: refusal mapping; click) and `cargo test -p cua-driver-core --lib`.
 - Native, on this Mac, `cargo test -p platform-macos --test background_focus_oracle -- --run-gui`,
   13 cases: Arrange Left runs exactly once with the fixture active and its
@@ -257,15 +281,19 @@ with no key window (`background_focus_oracle` against ded0c1748).
   `prepare_background_pixel_click`), which sends the activation notice
   without a deactivation; neither can be verified here (TextEdit with
   Automation, a browser). They are the next callers to move.
-- `hotkey`'s key route writes the element focus inside its `Keys` binding
-  (the order it had before). The binding sends no record when the window
-  already routes keys, the common case; when it does send them, fact 11
-  applies and the focus write should move before the binding as the menu
-  route's did.
-- The hotkey menu route with an element in a sibling window (hypothesis
-  above); `Keys` on a LibreOffice that has never been active (the case the
-  binding exists for) and on a front target's other window, beyond the
-  hermetic sequence tests.
+- The hotkey routes with an element in a sibling window (hypothesis above);
+  `Keys` on a LibreOffice that has never been active (the case the binding
+  exists for) and on a front target's other window, beyond the hermetic
+  sequence tests.
+- Follow-up: the in-place switch in a target the user has in front takes the
+  user's own typing. From the first deactivation notice to the switch back
+  (about half a second) keys the user types go nowhere or into the bound
+  window, mixed with the driver's, and the user's window gets resign and
+  become-active notifications (a browser page sees blur and focus). The
+  key-focus guard is not armed for a front target. The switch is kept as the
+  earlier primer had it; refusing a background key post to another window of
+  the user's front app (advising `delivery_mode:"foreground"`) or measuring
+  the interception is open.
 - Chromium, Electron and Catalyst targets under the `Active` binding beyond
   what the pixel prologue already did; Space preservation; what AppKit keys
   on the user's next real activation of a target whose key window the driver
