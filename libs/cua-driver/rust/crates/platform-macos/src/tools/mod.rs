@@ -304,6 +304,36 @@ pub(crate) fn background_refusal_result(
     .with_structured(structured)
 }
 
+/// The structured refusal for a window that could not be bound as the app's
+/// synthetic focus context ([`crate::synthetic_focus`]): nothing was
+/// dispatched.
+pub(crate) fn synthetic_focus_refusal(
+    pid: i32,
+    window_id: u32,
+    refusal: &crate::synthetic_focus::Refusal,
+) -> cua_driver_core::protocol::ToolResult {
+    use crate::synthetic_focus::Refusal;
+    use cua_driver_core::background_input::refusal_codes;
+    let (code, advice) = match refusal {
+        Refusal::WindowServerConnection => {
+            return windowserver_connection_refusal(pid, Some(window_id));
+        }
+        Refusal::NotOwned { owner: None, .. } => (refusal_codes::WINDOW_NOT_FOUND, None),
+        Refusal::NotOwned { owner: Some(_), .. } => (refusal_codes::OWNER_PID_MISMATCH, None),
+        Refusal::Unconfirmed { .. } => (WINDOW_NOT_KEY, Some("foreground")),
+        Refusal::FrontChanged { .. } => (WINDOW_NOT_KEY, None),
+    };
+    background_refusal_result(
+        pid,
+        window_id,
+        &cua_driver_core::background_input::BackgroundRefusal {
+            code,
+            reason: refusal.to_string(),
+            advice,
+        },
+    )
+}
+
 /// Hint shown with every `windowserver_connection_invalid` refusal.
 pub(crate) const WINDOWSERVER_INVALID_HINT: &str = "This daemon runs without its own app-bundle identity (a bare `cua-driver serve`), so macOS gives it no valid WindowServer connection and every no-raise focus step fails. Run the app-bundle daemon: `cua-driver permissions grant`.";
 

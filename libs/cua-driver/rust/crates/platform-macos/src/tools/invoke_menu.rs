@@ -25,6 +25,7 @@ use crate::ax::bindings::{
     copy_element_attr, copy_string_attr, kAXErrorSuccess, perform_action, set_bool_attr_true,
     AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
+use crate::synthetic_focus::{Binding, Refusal};
 
 pub struct InvokeMenuTool;
 
@@ -534,12 +535,14 @@ fn exact_window_is_ready(
     frontmost_pid == Some(target_pid) && focused_window_id == Some(target_window_id)
 }
 
-/// The item could not be invoked with its app in the background. Activating
-/// the app would take the user's front window, so refuse and name the route.
+/// The item could not be invoked with its app in the background. Bringing
+/// the app to the front would take the user's front window, so refuse and
+/// name the route.
 fn background_unavailable(reason: String) -> ToolResult {
     let message = format!(
-        "{reason}. invoke_menu does not activate a background app: macOS keeps this menu item \
-         unavailable while the app is behind the user's window. If the user allows it, call \
+        "{reason}. invoke_menu does not activate a background app: the window was handed to the \
+         app as its key window in the background, and the app still keeps this menu item \
+         unavailable while it is behind the user's window. If the user allows it, call \
          bring_to_front for this window first, then invoke_menu, or send the app's keyboard \
          shortcut with hotkey and delivery_mode:\"foreground\". A background hotkey does not \
          help: the disabled item ignores its shortcut too. Otherwise use the control in the \
@@ -561,11 +564,29 @@ enum BackgroundPressError {
         is_save: bool,
     },
     Other(String),
+    /// The requested window is not, or could not be made, the app's key and
+    /// main window.
     UnboundWindow {
         requested: u32,
         focused: Option<u32>,
         main: Option<u32>,
     },
+    /// The daemon has no valid WindowServer connection.
+    Connection,
+}
+
+impl From<Refusal> for BackgroundPressError {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::Unconfirmed { window, state, .. } => BackgroundPressError::UnboundWindow {
+                requested: window,
+                focused: state.focused,
+                main: state.main,
+            },
+            Refusal::WindowServerConnection => BackgroundPressError::Connection,
+            other => BackgroundPressError::Other(format!("invoke_menu: {other}")),
+        }
+    }
 }
 
 /// What the background route knows about the pressed item.
@@ -582,10 +603,22 @@ unsafe fn item_is_save(item: AXUIElementRef) -> bool {
             == 0.0
 }
 
-/// How long a disabled item gets to enable after its window becomes key, and
-/// how often it is re-read.
+/// How long a disabled item gets to enable after its window was bound as the
+/// app's key window, and how often it is re-read. AppKit validates the item
+/// when it is read; the first read can still see the state from before the
+/// binding.
 const ENABLE_WAIT: Duration = Duration::from_millis(600);
 const ENABLE_POLL: Duration = Duration::from_millis(40);
+
+/// Whether `item` is enabled, giving it [`ENABLE_WAIT`] to re-validate.
+unsafe fn await_enabled(item: AXUIElementRef) -> bool {
+    let mut waited = Duration::ZERO;
+    while waited < ENABLE_WAIT && copy_bool_attr(item, "AXEnabled") == Some(false) {
+        std::thread::sleep(ENABLE_POLL);
+        waited += ENABLE_POLL;
+    }
+    copy_bool_attr(item, "AXEnabled") != Some(false)
+}
 
 /// AppKit resolves document menus against its key/main window, not the ID
 /// supplied by a caller. Unknown or sibling context must fail before lookup.
@@ -630,7 +663,8 @@ fn unbound_menu_window(
         &cua_driver_core::background_input::BackgroundRefusal {
             code: super::WINDOW_NOT_KEY,
             reason: format!(
-                "invoke_menu: requested window {requested} is not the confirmed document menu context \
+                "invoke_menu: requested window {requested} could not be confirmed as the app's key \
+                 and main window, the document menu context, with the app in the background \
                  (focused={focused:?}, main={main:?}); no menu action was dispatched"
             ),
             advice: Some("foreground"),
@@ -639,9 +673,10 @@ fn unbound_menu_window(
 }
 
 /// Resolve the whole path from the app's live menu bar without opening any
-/// level, then perform the final item's action. Used for a background app:
-/// opening a menu-bar menu would take key focus and draw over the user's
-/// front app.
+/// level, then perform the final item's action. Used for a background app
+/// whose `window_id` [`run_in_background`] has bound as the app's key and
+/// main window: opening a menu-bar menu would take key focus and draw over
+/// the user's front app.
 unsafe fn invoke_path_in_background(
     pid: i32,
     window_id: u32,
@@ -654,6 +689,9 @@ unsafe fn invoke_path_in_background(
         ));
     }
     set_messaging_timeout(app);
+    // AppKit resolves document menus against its key and main window. The
+    // binding read that back; prove it again here, before anything is
+    // resolved, and once more before the dispatch.
     if let Err(error) = require_live_menu_window(app, window_id) {
         CFRelease(app as CFTypeRef);
         return Err(error);
@@ -670,19 +708,10 @@ unsafe fn invoke_path_in_background(
     set_messaging_timeout(target);
     let is_save = item_is_save(target);
     let result = (|| {
-        // Preserve enablement priming for an already-bound document. The
-        // context check above prevents this from switching to a sibling after
-        // resolving that sibling's menu; the check below revalidates dispatch.
-        if copy_bool_attr(target, "AXEnabled") == Some(false)
-            && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
-        {
-            let mut waited = Duration::ZERO;
-            while waited < ENABLE_WAIT && copy_bool_attr(target, "AXEnabled") == Some(false) {
-                std::thread::sleep(ENABLE_POLL);
-                waited += ENABLE_POLL;
-            }
-        }
-        if copy_bool_attr(target, "AXEnabled") == Some(false) {
+        // Window and document commands validate against the key window the
+        // app was just handed. An item that stays disabled is one the app
+        // keeps unavailable in the background (or always).
+        if !await_enabled(target) {
             return Err(BackgroundPressError::Disabled {
                 message: format!(
                     "invoke_menu: path segment {} is disabled while the app is in the background",
@@ -764,19 +793,21 @@ impl MenuRequest {
     }
 }
 
-/// Run a menu command in a background app without activating it. Presses
-/// the item through accessibility when macOS keeps it enabled; a disabled
-/// Save of a document window goes through the app's scripting interface
-/// instead (TextEdit disables Save while it is behind the user's window).
-/// A Save is verified on disk. Anything else that is disabled is refused
-/// with `background_unavailable`.
+/// Run a menu command in a background app without bringing it to the front.
+/// The requested window is bound as the app's key and main window for the
+/// command ([`crate::synthetic_focus`], confirmed by readback, or refused
+/// with `window_not_key`), the item is pressed through accessibility, and
+/// the binding is released. A Save of a document window that the app keeps
+/// disabled even so goes through the app's scripting interface instead, and
+/// is verified on disk. Anything else that stays disabled is refused with
+/// `background_unavailable`.
 pub(super) async fn run_in_background(
     pid: i32,
     window_id: u32,
     path: Vec<String>,
     request: MenuRequest,
 ) -> ToolResult {
-    let _mutation = super::acquire_background_mutation(pid).await;
+    let lease = super::acquire_background_mutation(pid).await;
     let document = tokio::task::spawn_blocking(move || document_path_of_window(pid, window_id))
         .await
         .ok()
@@ -785,14 +816,22 @@ pub(super) async fn run_in_background(
         .as_deref()
         .and_then(crate::apple_events::modified_time);
     let press_path = path.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        let _key_focus = crate::key_focus_guard::protect(pid);
-        unsafe { invoke_path_in_background(pid, window_id, &press_path) }
-    })
+    let guarded = crate::focus_guard::with_synthetic_focus(
+        pid,
+        window_id,
+        Binding::KeyMain,
+        "invoke_menu.background",
+        Some(lease),
+        move || unsafe { invoke_path_in_background(pid, window_id, &press_path) },
+    )
     .await;
+    let (_mutation, outcome) = match guarded {
+        Ok(guarded) => (guarded.lease, guarded.result),
+        Err(error) => return refusal(format!("invoke_menu: blocking task failed: {error}")),
+    };
     let preface = request.preface(&path);
     match outcome {
-        Ok(Ok(PressedItem { is_save: true })) if document.is_some() => {
+        Ok(PressedItem { is_save: true }) if document.is_some() => {
             let file = document.clone().expect("checked");
             let written = tokio::task::spawn_blocking(move || {
                 crate::apple_events::wait_for_new_mtime(&file, before, Duration::from_secs(2))
@@ -804,7 +843,7 @@ pub(super) async fn run_in_background(
                 background_success(
                     format!(
                         "{preface}Pressed {} through accessibility with the app in the \
-                         background (not activated). Verified: {} was written to disk.",
+                         background (not brought to the front). Verified: {} was written to disk.",
                         path.join(" > "),
                         file.display()
                     ),
@@ -816,7 +855,8 @@ pub(super) async fn run_in_background(
                 background_success(
                     format!(
                         "{preface}Pressed {} through accessibility with the app in the \
-                         background (not activated), but {} did not change on disk within 2 s. \
+                         background (not brought to the front), but {} did not change on disk \
+                         within 2 s. \
                          The document may have had no unsaved changes, or the save did not run; \
                          verify from fresh state.",
                         path.join(" > "),
@@ -828,20 +868,22 @@ pub(super) async fn run_in_background(
                 )
             }
         }
-        Ok(Ok(_)) => background_success(
+        Ok(_) => background_success(
             format!(
                 "{preface}Invoked {} through accessibility with the app in the background (not \
-                 activated); verify the command's semantic effect from fresh state.",
+                 brought to the front; window {window_id} was the app's key window for the \
+                 command); verify the command's semantic effect from fresh state.",
                 path.join(" > ")
             ),
             ActionEffect::Unverifiable,
             ActionTransport::MacosAxAction,
-            "Every menu hop resolved uniquely without opening it and AX accepted the final action",
+            "Every menu hop resolved uniquely without opening it and AX accepted the final action \
+             with the window confirmed as the app's key and main window",
         ),
-        Ok(Err(BackgroundPressError::Disabled {
+        Err(BackgroundPressError::Disabled {
             is_save: true,
             message,
-        })) if document.is_some() => {
+        }) if document.is_some() => {
             let file = document.expect("checked");
             let bundle_id = crate::apps::bundle_id_for_pid(pid).unwrap_or_default();
             let app_name =
@@ -857,7 +899,8 @@ pub(super) async fn run_in_background(
                     format!(
                         "{preface}{} is disabled while {app_name} is in the background, so the \
                          document was saved through {app_name}'s scripting interface instead \
-                         (not activated). Verified: {app_name} reports no unsaved changes{}.",
+                         (not brought to the front). Verified: {app_name} reports no unsaved \
+                         changes{}.",
                         path.join(" > "),
                         if saved.file_written {
                             format!(" and {} was written to disk", file.display())
@@ -881,16 +924,18 @@ pub(super) async fn run_in_background(
                 Err(error) => refusal(format!("invoke_menu: blocking task failed: {error}")),
             }
         }
-        Ok(Err(BackgroundPressError::Disabled { message, .. })) => {
+        Err(BackgroundPressError::Disabled { message, .. }) => {
             background_unavailable(format!("{preface}{message}"))
         }
-        Ok(Err(BackgroundPressError::UnboundWindow {
+        Err(BackgroundPressError::UnboundWindow {
             requested,
             focused,
             main,
-        })) => unbound_menu_window(pid, requested, focused, main),
-        Ok(Err(BackgroundPressError::Other(error))) => refusal(error),
-        Err(error) => refusal(format!("invoke_menu: blocking task failed: {error}")),
+        }) => unbound_menu_window(pid, requested, focused, main),
+        Err(BackgroundPressError::Connection) => {
+            super::windowserver_connection_refusal(pid, Some(window_id))
+        }
+        Err(BackgroundPressError::Other(error)) => refusal(error),
     }
 }
 
@@ -1046,6 +1091,31 @@ mod tests {
                     if f == focused && m == main
             ));
         }
+    }
+
+    #[test]
+    fn an_unconfirmed_binding_is_the_unbound_window_refusal() {
+        let refusal = Refusal::Unconfirmed {
+            window: 7,
+            binding: Binding::KeyMain,
+            state: crate::synthetic_focus::TargetState {
+                frontmost: Some(true),
+                focused: Some(8),
+                main: Some(7),
+            },
+        };
+        assert!(matches!(
+            BackgroundPressError::from(refusal),
+            BackgroundPressError::UnboundWindow {
+                requested: 7,
+                focused: Some(8),
+                main: Some(7)
+            }
+        ));
+        assert!(matches!(
+            BackgroundPressError::from(Refusal::WindowServerConnection),
+            BackgroundPressError::Connection
+        ));
     }
 
     #[test]

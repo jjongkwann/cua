@@ -30,8 +30,8 @@ use crate::ax::bindings::{
     element_at_screen_position, element_screen_rect, kAXErrorSuccess, AXUIElementPerformAction,
     AXUIElementRef,
 };
-use crate::focus_guard;
-use crate::window_change_detector::WindowChangeDetector;
+use crate::focus_guard::{self, FocusPolicy};
+use crate::synthetic_focus::{Binding, Refusal, Report};
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
 
 use super::pixel_route::PixelClickRoute;
@@ -49,17 +49,22 @@ impl ClickTool {
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
-/// Focus posture for the raw pixel transport after AX hit-testing has failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PixelActivationPolicy {
-    /// Standard background delivery: suppress activation of the target.
-    SuppressTarget,
-    /// Left-click with a concrete window: intentionally make the target
-    /// AppKit-active without raising it, while suppressing every other app.
-    AllowTargetWithoutRaise,
-    /// Explicit foreground rung owns its brief activation and restoration.
-    ForegroundAssist,
+/// Why an AX click did not act: the window could not be bound as the app's
+/// key window (nothing was dispatched), or the action itself failed.
+enum ClickError {
+    Focus(Refusal),
+    Action(anyhow::Error),
 }
+
+impl From<Refusal> for ClickError {
+    fn from(refusal: Refusal) -> Self {
+        ClickError::Focus(refusal)
+    }
+}
+
+/// What a blocking AX click reports: `(summary_text, needs_webkit_delay,
+/// suspected_noop, selection_verified, selection_via_pixel)`.
+type AxClickOutcome = (String, bool, bool, bool, bool);
 
 #[derive(Clone, Copy, Debug)]
 struct SelectionPixelTarget {
@@ -185,34 +190,41 @@ fn settled_value(
     }
 }
 
-fn pixel_activation_policy(
+/// Focus posture for the raw pixel transport after AX hit-testing has failed.
+/// A background left click with a concrete window binds the target as
+/// synthetically active for the click (Chromium's user-activation gate and
+/// remote-HID proxies such as iPhone Mirroring accept the click only from an
+/// active app) and releases it afterwards; other buttons keep strict
+/// suppression; the explicit foreground rung owns its own activation.
+fn pixel_focus_policy(
     button: &str,
     effective_foreground: bool,
-    has_window: bool,
-) -> PixelActivationPolicy {
-    if effective_foreground {
-        PixelActivationPolicy::ForegroundAssist
-    } else if button == "left" && has_window {
-        PixelActivationPolicy::AllowTargetWithoutRaise
-    } else {
-        PixelActivationPolicy::SuppressTarget
+    window_id: Option<u32>,
+) -> FocusPolicy {
+    match window_id {
+        _ if effective_foreground => FocusPolicy::Foreground,
+        Some(window_id) if button == "left" => FocusPolicy::Synthetic {
+            window_id,
+            binding: Binding::Active,
+        },
+        _ => FocusPolicy::Suppress,
     }
 }
 
 /// Return the prior foreground pid that should be restored after a raw
-/// background pixel click.
+/// background pixel click that allowed the target to activate.
 ///
 /// This decision deliberately depends on observed application state rather
-/// than the private focus recipe's return value. The recipe can be unavailable
-/// or partially fail while the raw click still makes the target AppKit-active;
-/// in that case the allow-target suppression lease will not restore it for us.
+/// than the synthetic binding's result. The binding can be unavailable while
+/// the raw click still makes the target AppKit-active; in that case the
+/// allow-target suppression lease will not restore it for us.
 fn background_pixel_restore_pid(
-    activation_policy: PixelActivationPolicy,
+    allowed_target_activation: bool,
     prior_front: Option<i32>,
     target_pid: i32,
     observed_front: Option<i32>,
 ) -> Option<i32> {
-    if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
+    if allowed_target_activation
         && prior_front != Some(target_pid)
         && observed_front == Some(target_pid)
     {
@@ -223,60 +235,61 @@ fn background_pixel_restore_pid(
 }
 
 /// Hand the user's frontmost app and key window back after a raw background
-/// pixel action that ran the focus-without-raise prologue (click, drag).
+/// pixel action that ran with the target synthetically active (click, drag).
 ///
-/// The no-raise record can make NSWorkspace report the target as active even
-/// though its window never moved in z-order. Once the input has been queued,
-/// restore the prior app if the target is still reported frontmost. Base this
-/// on observed state, not `focus_without_raise`: the private recipe can report
-/// failure after partially activating the target, and the raw input can
-/// self-activate even when that recipe is unavailable. Do not overwrite a
-/// different app here; the wildcard suppression lease handles genuine side
+/// The binding itself is released by [`crate::synthetic_focus`]; this covers
+/// what the raw input did on top of it. NSWorkspace can report the target as
+/// active even though its window never moved in z-order: once the input has
+/// been queued, restore the prior app if the target is still reported
+/// frontmost. Base this on observed state, not on `synthetic`: the raw input
+/// can self-activate even when the binding was unavailable. Do not overwrite
+/// a different app here; the wildcard suppression lease handles genuine side
 /// effects.
 pub(super) async fn restore_user_focus_after_background_pixel(
     pid: i32,
     prior_front: Option<i32>,
     prior_key_wid: Option<u32>,
     window_id: Option<u32>,
-    focus_without_raise: bool,
+    synthetic: bool,
 ) {
     if prior_front == Some(pid) {
         return;
     }
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let reactivated = if let Some(previous_pid) = background_pixel_restore_pid(
-        PixelActivationPolicy::AllowTargetWithoutRaise,
-        prior_front,
-        pid,
-        apps::frontmost_pid(),
-    ) {
+    let reactivated = if let Some(previous_pid) =
+        background_pixel_restore_pid(true, prior_front, pid, apps::frontmost_pid())
+    {
         let _ = apps::activate_pid(previous_pid);
         wait_until_frontmost(previous_pid, std::time::Duration::from_millis(300)).await;
         true
     } else {
         false
     };
-    // The prologue leaves the user's window key, but the input can still make
+    // The binding leaves the user's window key, but the input can still make
     // the target self-activate, and re-activating the prior app does not by
     // itself make its window key again. Post the focus record to the user's
     // window only then, or when WindowServer's key focus left the user's app.
     // Posting it while their window is still key re-activates their app
     // (AppKit sends it didBecomeActive), which Bench v2 counted as a
     // disturbance after every background pixel click.
-    if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
+    if let Some(previous_pid) = prior_front.filter(|_| window_id.is_some()) {
         let key_moved = user_focus_needs_restore(
             reactivated,
-            focus_without_raise,
+            synthetic,
             crate::input::skylight::key_focus_pid(),
             previous_pid,
         );
         if key_moved && apps::frontmost_pid() == Some(previous_pid) {
             let _ = tokio::task::spawn_blocking(move || {
-                crate::input::skylight::restore_focus_after_without_raise(
+                let Some(previous_wid) = prior_key_wid
+                    .or_else(|| crate::input::skylight::key_window_of_pid(previous_pid))
+                else {
+                    return false;
+                };
+                crate::input::skylight::activate_without_raise_with(
                     previous_pid,
-                    prior_key_wid,
-                    pid,
-                    wid,
+                    previous_wid,
+                    false,
                 )
             })
             .await;
@@ -290,11 +303,11 @@ pub(super) async fn restore_user_focus_after_background_pixel(
 /// their app become active again.
 fn user_focus_needs_restore(
     reactivated: bool,
-    focus_without_raise: bool,
+    synthetic: bool,
     key_focus: Option<i32>,
     previous_pid: i32,
 ) -> bool {
-    reactivated || (focus_without_raise && key_focus.is_some_and(|pid| pid != previous_pid))
+    reactivated || (synthetic && key_focus.is_some_and(|pid| pid != previous_pid))
 }
 
 /// Poll until `pid` is the frontmost application or `budget` runs out.
@@ -598,7 +611,7 @@ impl Tool for ClickTool {
             // and is therefore held to the stricter WindowPointer rung. Gate
             // BEFORE any cursor/dispatch work so a stale or sibling-owned
             // target refuses instead of acting on the wrong window.
-            let _mutation_lease = if !delivery_mode.is_foreground() {
+            let mut _mutation_lease = if !delivery_mode.is_foreground() {
                 let gate_action = if button_str == "middle" {
                     cua_driver_core::background_input::BackgroundAction::WindowPointer
                 } else {
@@ -799,11 +812,27 @@ impl Tool for ClickTool {
             // suffix matching Swift's wording.
             let prior_front = apps::frontmost_pid();
             let foreground = delivery_mode.is_foreground();
-            let snapshot = if foreground {
-                WindowChangeDetector::snapshot_without_suppression(prior_front)
+            // A background AXPress in a native app sends its action through
+            // the key window's responder chain (see press_needs_key_window):
+            // the window is bound as the app's key window for the press.
+            let policy = if foreground {
+                FocusPolicy::Foreground
             } else {
-                WindowChangeDetector::snapshot(prior_front)
+                let ax_action =
+                    crate::input::ax_actions::map_action(&effective_action).unwrap_or("");
+                let native = tokio::task::spawn_blocking(move || is_native_app(pid))
+                    .await
+                    .unwrap_or(false);
+                if press_needs_key_window(ax_action, prior_front, pid, native) {
+                    FocusPolicy::Synthetic {
+                        window_id: wid,
+                        binding: Binding::Key,
+                    }
+                } else {
+                    FocusPolicy::Suppress
+                }
             };
+            let snapshot = policy.snapshot(prior_front, pid);
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
@@ -814,64 +843,98 @@ impl Tool for ClickTool {
             // and stomp default for a non-default session).
             let ck = cursor_key.clone();
             let selection_modifiers = modifiers.clone();
-            let result = focus_guard::with_focus_suppressed(
-                if foreground { None } else { Some(pid) },
-                prior_front,
-                "click.AXPress",
-                || async move {
-                    tokio::task::spawn_blocking(move || {
-                        let element_ptr = element_guard.as_ptr();
-                        if foreground {
-                            let mut outcome = None;
-                            let has_modifiers = !selection_modifiers.is_empty();
-                            let action = || {
-                                outcome = Some(perform_ax_click(
-                                    (element_ptr, idx),
+            let result: Result<Result<(AxClickOutcome, bool), ClickError>, tokio::task::JoinError> =
+                match policy {
+                    FocusPolicy::Synthetic { window_id, binding } => {
+                        let guarded = focus_guard::with_synthetic_focus(
+                            pid,
+                            window_id,
+                            binding,
+                            "click.AXPress",
+                            _mutation_lease.take(),
+                            move || {
+                                perform_ax_click(
+                                    (element_guard.as_ptr(), idx),
                                     (pid, wid),
                                     &action_clone,
                                     &ck,
                                     selection_pixel,
                                     &selection_modifiers,
-                                    foreground,
-                                )?);
-                                std::thread::sleep(std::time::Duration::from_millis(150));
-                                Ok(())
-                            };
-                            let fronted = if has_modifiers {
-                                crate::input::skylight::with_foreground_hid_activation(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    action,
-                                )?;
-                                true
-                            } else {
-                                crate::input::skylight::with_foreground_assist(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    action,
-                                )?
-                            };
-                            let outcome = outcome.ok_or_else(|| {
-                                anyhow::anyhow!("foreground AX click did not execute")
-                            })?;
-                            Ok((outcome, fronted))
-                        } else {
-                            perform_ax_click(
-                                (element_ptr, idx),
-                                (pid, wid),
-                                &action_clone,
-                                &ck,
-                                selection_pixel,
-                                &selection_modifiers,
-                                false,
-                            )
-                            .map(|outcome| (outcome, false))
+                                    false,
+                                )
+                                .map(|outcome| (outcome, false))
+                                .map_err(ClickError::Action)
+                            },
+                        )
+                        .await;
+                        match guarded {
+                            Ok(guarded) => {
+                                _mutation_lease = guarded.lease;
+                                Ok(guarded.result)
+                            }
+                            Err(error) => Err(error),
                         }
-                    })
+                    }
+                    _ => focus_guard::with_focus_suppressed(
+                        policy.suppressed_target(pid),
+                        prior_front,
+                        "click.AXPress",
+                        || async move {
+                            tokio::task::spawn_blocking(move || {
+                                let element_ptr = element_guard.as_ptr();
+                                if foreground {
+                                    let mut outcome = None;
+                                    let has_modifiers = !selection_modifiers.is_empty();
+                                    let action = || {
+                                        outcome = Some(perform_ax_click(
+                                            (element_ptr, idx),
+                                            (pid, wid),
+                                            &action_clone,
+                                            &ck,
+                                            selection_pixel,
+                                            &selection_modifiers,
+                                            foreground,
+                                        )?);
+                                        std::thread::sleep(std::time::Duration::from_millis(150));
+                                        Ok(())
+                                    };
+                                    let fronted = if has_modifiers {
+                                        crate::input::skylight::with_foreground_hid_activation(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            action,
+                                        )?;
+                                        true
+                                    } else {
+                                        crate::input::skylight::with_foreground_assist(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            action,
+                                        )?
+                                    };
+                                    let outcome = outcome.ok_or_else(|| {
+                                        anyhow::anyhow!("foreground AX click did not execute")
+                                    })?;
+                                    Ok((outcome, fronted))
+                                } else {
+                                    perform_ax_click(
+                                        (element_ptr, idx),
+                                        (pid, wid),
+                                        &action_clone,
+                                        &ck,
+                                        selection_pixel,
+                                        &selection_modifiers,
+                                        false,
+                                    )
+                                    .map(|outcome| (outcome, false))
+                                }
+                            })
+                            .await
+                        },
+                    )
                     .await
-                },
-            )
-            .await;
+                    .map(|outcome| outcome.map_err(ClickError::Action)),
+                };
 
             // Drop the wildcard lease + detect window/foreground side-effects.
             let acted_at = std::time::Instant::now();
@@ -939,7 +1002,12 @@ impl Tool for ClickTool {
                     }
                     ToolResult::text(msg).with_structured(structured)
                 }
-                Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
+                Ok(Err(ClickError::Focus(refusal))) => {
+                    super::synthetic_focus_refusal(pid, wid, &refusal)
+                }
+                Ok(Err(ClickError::Action(e))) => {
+                    ToolResult::error(format!("AX action failed: {e}"))
+                }
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else if let (Some(mut cx), Some(mut cy)) = (x, y) {
@@ -1088,7 +1156,7 @@ impl Tool for ClickTool {
             // BEFORE the AX hit-test backend and any cursor/dispatch work.
             // delivery_mode:"foreground" stays the explicit last resort.
             let mutation_lease_held = crate::background_mutation::held_by_current_task(pid);
-            let _mutation_lease = if !delivery_mode.is_foreground() && !mutation_lease_held {
+            let mut _mutation_lease = if !delivery_mode.is_foreground() && !mutation_lease_held {
                 if let Some(wid) = window_id {
                     match super::gate_background_window_action(
                         pid,
@@ -1249,43 +1317,20 @@ impl Tool for ClickTool {
                 Ok(route) => route,
                 Err(refusal) => return refusal,
             };
-            let activation_policy = pixel_activation_policy(&button_str, fg, window_id.is_some());
+            let policy = pixel_focus_policy(&button_str, fg, window_id);
 
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
             // A pixel click can land on a "Sign In" button that opens a sheet
             // or a Safari link that activates a new tab — same side-effect
-            // shape as the AX path, so we wrap identically.
+            // shape as the AX path, so we wrap identically. The policy picks
+            // the snapshot whose suppression matches the synthetic binding.
             let prior_front = apps::frontmost_pid();
-            let snapshot = match activation_policy {
-                PixelActivationPolicy::SuppressTarget => {
-                    WindowChangeDetector::snapshot(prior_front)
-                }
-                PixelActivationPolicy::AllowTargetWithoutRaise => {
-                    WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
-                }
-                PixelActivationPolicy::ForegroundAssist => {
-                    WindowChangeDetector::snapshot_without_suppression(prior_front)
-                }
-            };
-
-            // A raw click can open a menu (a popup drawn without AX, a canvas
-            // context menu); keep the user's key focus if it does.
-            let _key_focus = if fg {
-                None
-            } else {
-                tokio::task::spawn_blocking(move || crate::key_focus_guard::protect(pid))
-                    .await
-                    .ok()
-                    .flatten()
-            };
+            let snapshot = policy.snapshot(prior_front, pid);
 
             // The user's key window, read before the click, so the restore
             // below hands key status back to exactly that window.
-            let prior_key_wid = match prior_front {
-                Some(prior)
-                    if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-                        && prior != pid =>
-                {
+            let prior_key_wid = match (prior_front, policy) {
+                (Some(prior), FocusPolicy::Synthetic { .. }) if prior != pid => {
                     tokio::task::spawn_blocking(move || {
                         crate::input::skylight::key_window_of_pid(prior)
                     })
@@ -1296,143 +1341,154 @@ impl Tool for ClickTool {
                 _ => None,
             };
 
-            // Restore the Swift background-click prologue that was left
-            // disconnected in the original Rust port. It makes an opaque
-            // target AppKit-active without raising/restacking its window, which
-            // is required by Chromium gates and remote-HID proxies such as
-            // iPhone Mirroring. Re-pin after the focus record because changing
-            // AppKit active state can disturb overlay ordering.
-            let focus_without_raise = if activation_policy
-                == PixelActivationPolicy::AllowTargetWithoutRaise
-            {
-                let wid = window_id.expect("activation policy requires window_id");
-                match tokio::task::spawn_blocking(move || {
-                    crate::input::mouse::prepare_background_pixel_click(pid, wid)
-                })
-                .await
-                {
-                    Ok(activated) => {
-                        if !activated && crate::input::skylight::windowserver_connection_invalid() {
-                            return super::windowserver_connection_refusal(pid, Some(wid));
-                        }
-                        crate::cursor::overlay::send_command(
-                            cursor_key.clone(),
-                            cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                        );
-                        activated
-                    }
-                    Err(error) => {
-                        return ToolResult::error(format!(
-                            "Background click activation task failed: {error}"
-                        ));
-                    }
-                }
-            } else {
-                false
-            };
-
-            // Pulse only after the activation settle so it visually coincides
-            // with the real target click rather than the private focus prelude.
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse {
-                    x: screen_x,
-                    y: screen_y,
-                },
-            );
-
             let mods_owned = modifiers.clone();
             // Surface 5: route to the right/middle CGEvent primitives when
             // button != left. Left-button path stays on the existing Chromium-
             // routed `click_at_xy_with_window_local` for back-compat.
             let button_kind = button_str.clone();
-            let result = focus_guard::with_focus_suppressed(
-                if activation_policy == PixelActivationPolicy::SuppressTarget {
-                    Some(pid)
-                } else {
-                    None
-                },
-                prior_front,
-                "click.pixel",
-                || async move {
-                    tokio::task::spawn_blocking(move || {
-                        let do_click = move || -> anyhow::Result<()> {
-                            let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                            if route == PixelClickRoute::ForegroundHid {
-                                // Warp the hardware pointer to the mapped global
-                                // point and post at the HID tap. The pointer stays
-                                // at the target, as on Windows and X11, so apps that
-                                // read the pointer when handling the event see it.
-                                return crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                                    screen_x,
-                                    screen_y,
-                                    count,
-                                    &button_kind,
-                                    &m,
-                                );
-                            }
-                            match button_kind.as_str() {
-                                "right" => {
-                                    if let Some(wid) = window_id {
-                                        return crate::input::mouse::right_click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
-                                        );
-                                    }
-                                    crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
-                                }
-                                "middle" => {
-                                    if let Some(wid) = window_id {
-                                        return crate::input::mouse::middle_click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
-                                        );
-                                    }
-                                    crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m)
-                                }
-                                // "left" (default) or anything else — preserve legacy left-click path.
-                                _ => {
-                                    // When we know the window_id, use the targeted primitive so
-                                    // foreground delivery can stamp window-local coordinates and
-                                    // background delivery can retain the translated screen point
-                                    // while adding Chromium routing fields (f40, f51, f58, f91, f92).
-                                    if let Some(wid) = window_id {
-                                        return crate::input::mouse::click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y,
-                                            win_local_x, win_local_y,
-                                            wid, count, &m,
-                                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
-                                        );
-                                    }
-                                    crate::input::mouse::click_at_xy(pid, screen_x, screen_y, count, &m)
-                                }
-                            }
-                        };
-                        // Foreground rung: front the exact window → HID click →
-                        // restore the prior front process. The HID tap has no
-                        // pid addressing, so activation must be proven (the
-                        // window is AX-focused) or no input is sent.
-                        match (route, window_id) {
-                            (PixelClickRoute::ForegroundHid, Some(wid)) => {
-                                crate::input::skylight::with_foreground_hid_activation(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    do_click,
-                                )
-                            }
-                            _ => do_click(),
+            let overlay_key = cursor_key.clone();
+            let do_click = move || -> anyhow::Result<()> {
+                // Re-pin after the binding, which can disturb overlay
+                // ordering, and pulse right before the click so it coincides
+                // with the real target click rather than the focus prelude.
+                if let Some(wid) = window_id {
+                    crate::cursor::overlay::send_command(
+                        overlay_key.clone(),
+                        cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                    );
+                }
+                crate::cursor::overlay::send_command(
+                    overlay_key,
+                    cursor_overlay::OverlayCommand::ClickPulse {
+                        x: screen_x,
+                        y: screen_y,
+                    },
+                );
+                let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
+                if route == PixelClickRoute::ForegroundHid {
+                    // Warp the hardware pointer to the mapped global
+                    // point and post at the HID tap. The pointer stays
+                    // at the target, as on Windows and X11, so apps that
+                    // read the pointer when handling the event see it.
+                    return crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                        screen_x,
+                        screen_y,
+                        count,
+                        &button_kind,
+                        &m,
+                    );
+                }
+                match button_kind.as_str() {
+                    "right" => {
+                        if let Some(wid) = window_id {
+                            return crate::input::mouse::right_click_at_xy_with_window_local(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                &m,
+                            );
                         }
-                    })
+                        crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+                    }
+                    "middle" => {
+                        if let Some(wid) = window_id {
+                            return crate::input::mouse::middle_click_at_xy_with_window_local(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                &m,
+                            );
+                        }
+                        crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m)
+                    }
+                    // "left" (default) or anything else — preserve legacy left-click path.
+                    _ => {
+                        // When we know the window_id, use the targeted primitive so
+                        // foreground delivery can stamp window-local coordinates and
+                        // background delivery can retain the translated screen point
+                        // while adding Chromium routing fields (f40, f51, f58, f91, f92).
+                        if let Some(wid) = window_id {
+                            return crate::input::mouse::click_at_xy_with_window_local(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                count,
+                                &m,
+                                crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                            );
+                        }
+                        crate::input::mouse::click_at_xy(pid, screen_x, screen_y, count, &m)
+                    }
+                }
+            };
+            let (result, focus) = match policy {
+                // The target is synthetically active for the click and told
+                // to resign afterwards, all on the blocking thread.
+                FocusPolicy::Synthetic { window_id, binding } => {
+                    match focus_guard::with_synthetic_focus(
+                        pid,
+                        window_id,
+                        binding,
+                        "click.pixel",
+                        _mutation_lease.take(),
+                        do_click,
+                    )
                     .await
-                },
-            )
-            .await;
+                    {
+                        Ok(guarded) => {
+                            _mutation_lease = guarded.lease;
+                            (Ok(guarded.result), guarded.focus)
+                        }
+                        Err(error) => (Err(error), Report::default()),
+                    }
+                }
+                _ => (
+                    focus_guard::with_focus_suppressed(
+                        policy.suppressed_target(pid),
+                        prior_front,
+                        "click.pixel",
+                        || async move {
+                            tokio::task::spawn_blocking(move || {
+                                // Foreground rung: front the exact window → HID
+                                // click → restore the prior front process. The
+                                // HID tap has no pid addressing, so activation
+                                // must be proven (the window is AX-focused) or
+                                // no input is sent.
+                                match (route, window_id) {
+                                    (PixelClickRoute::ForegroundHid, Some(wid)) => {
+                                        crate::input::skylight::with_foreground_hid_activation(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            do_click,
+                                        )
+                                    }
+                                    _ => do_click(),
+                                }
+                            })
+                            .await
+                        },
+                    )
+                    .await,
+                    Report::default(),
+                ),
+            };
 
-            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
+            if matches!(policy, FocusPolicy::Synthetic { .. }) {
                 restore_user_focus_after_background_pixel(
                     pid,
                     prior_front,
                     prior_key_wid,
                     window_id,
-                    focus_without_raise,
+                    focus.synthetic,
                 )
                 .await;
             }
@@ -1461,8 +1517,13 @@ impl Tool for ClickTool {
                         "path": super::pixel_route::path_label(route),
                         "verified": false,
                         "effect": "unverifiable",
-                        "focus_without_raise": focus_without_raise
+                        "focus_without_raise": focus.synthetic
                     }))
+                }
+                Ok(Err(e))
+                    if e.downcast_ref::<Refusal>() == Some(&Refusal::WindowServerConnection) =>
+                {
+                    super::windowserver_connection_refusal(pid, window_id)
                 }
                 Ok(Err(e)) if route == PixelClickRoute::ForegroundHid => {
                     super::pixel_route::foreground_unavailable(
@@ -1505,17 +1566,11 @@ fn press_needs_key_window(action: &str, front_pid: Option<i32>, pid: i32, native
     action == "AXPress" && native && front_pid != Some(pid)
 }
 
-/// Make the target window AppKit-key without raising it, activating the app
-/// or taking key status from the user's window (the focus record only, as the
-/// background pixel click does), then let AppKit settle.
-fn prime_key_window_for_background_press(pid: i32, window_id: u32, action: &str) {
-    let native = !super::type_text::is_browser_pid(pid)
-        && !crate::browser::electron_js::ElectronJs::is_electron(pid);
-    if press_needs_key_window(action, apps::frontmost_pid(), pid, native)
-        && crate::input::skylight::activate_without_raise_with(pid, window_id, false)
-    {
-        std::thread::sleep(std::time::Duration::from_millis(80));
-    }
+/// A native (AppKit) app: not a browser and not an Electron shell, whose page
+/// content runs in its own process and takes no part in key-window routing.
+fn is_native_app(pid: i32) -> bool {
+    !super::type_text::is_browser_pid(pid)
+        && !crate::browser::electron_js::ElectronJs::is_electron(pid)
 }
 
 /// Whether an AX press on a text input must wait for the page to move DOM
@@ -1572,7 +1627,7 @@ fn perform_ax_click(
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
-) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+) -> anyhow::Result<AxClickOutcome> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
     let ax_action = crate::input::ax_actions::map_action(action_str)?;
@@ -1714,9 +1769,6 @@ fn perform_ax_click(
     let toggle_before = is_toggle_press(ax_action, &role, &advertised)
         .then(read_value)
         .flatten();
-    if !foreground {
-        prime_key_window_for_background_press(pid, window_id, ax_action);
-    }
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Checked before the row-selection fallback, which writes AXSelected
@@ -2080,26 +2132,29 @@ mod tests {
     /// without raising it. Other background buttons retain strict suppression,
     /// and the explicit foreground rung owns its separate activation.
     #[test]
-    fn raw_background_left_click_restores_focus_without_raise_policy() {
+    fn raw_background_left_click_binds_the_target_active_for_the_click() {
         assert_eq!(
-            pixel_activation_policy("left", false, true),
-            PixelActivationPolicy::AllowTargetWithoutRaise
+            pixel_focus_policy("left", false, Some(9)),
+            FocusPolicy::Synthetic {
+                window_id: 9,
+                binding: Binding::Active
+            }
         );
         assert_eq!(
-            pixel_activation_policy("left", false, false),
-            PixelActivationPolicy::SuppressTarget
+            pixel_focus_policy("left", false, None),
+            FocusPolicy::Suppress
         );
         assert_eq!(
-            pixel_activation_policy("right", false, true),
-            PixelActivationPolicy::SuppressTarget
+            pixel_focus_policy("right", false, Some(9)),
+            FocusPolicy::Suppress
         );
         assert_eq!(
-            pixel_activation_policy("middle", false, true),
-            PixelActivationPolicy::SuppressTarget
+            pixel_focus_policy("middle", false, Some(9)),
+            FocusPolicy::Suppress
         );
         assert_eq!(
-            pixel_activation_policy("left", true, true),
-            PixelActivationPolicy::ForegroundAssist
+            pixel_focus_policy("left", true, Some(9)),
+            FocusPolicy::Foreground
         );
     }
 
@@ -2121,32 +2176,17 @@ mod tests {
     #[test]
     fn failed_private_activation_still_restores_observed_target_focus() {
         assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::AllowTargetWithoutRaise,
-                Some(7),
-                42,
-                Some(42),
-            ),
+            background_pixel_restore_pid(true, Some(7), 42, Some(42)),
             Some(7)
         );
 
         assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::AllowTargetWithoutRaise,
-                Some(7),
-                42,
-                Some(99),
-            ),
+            background_pixel_restore_pid(true, Some(7), 42, Some(99)),
             None,
             "do not overwrite an unrelated app that became frontmost"
         );
         assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::SuppressTarget,
-                Some(7),
-                42,
-                Some(42),
-            ),
+            background_pixel_restore_pid(false, Some(7), 42, Some(42)),
             None,
             "strict-suppression paths retain their existing ownership"
         );

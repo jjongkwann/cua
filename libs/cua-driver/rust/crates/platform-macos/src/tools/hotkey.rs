@@ -316,13 +316,11 @@ impl Tool for HotkeyTool {
                 .ok()
                 .flatten();
                 if let Some(item) = menu_item {
-                    // The menu command acts on the app's key window. Make the
-                    // addressed window key first, confirmed, or refuse: never
-                    // act on another window (CUA-1767).
-                    match super::acquire_key_scope(pid, Some(wid), false).await {
-                        Ok(scope) => key_scope = scope,
-                        Err(refusal) => return refusal,
-                    }
+                    // The menu command acts on the app's key window.
+                    // run_in_background binds the addressed window as the
+                    // app's key and main window, confirmed, or refuses
+                    // (window_not_key): it never acts on another window
+                    // (CUA-1767).
                     if let Some(ptr) = element_ptr {
                         // The menu command acts on the focused element.
                         let focused =

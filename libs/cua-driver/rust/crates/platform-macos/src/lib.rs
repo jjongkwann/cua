@@ -58,6 +58,8 @@ pub mod session;
 #[cfg(all(test, target_os = "macos"))]
 mod step_latency_bench;
 #[cfg(target_os = "macos")]
+pub mod synthetic_focus;
+#[cfg(target_os = "macos")]
 pub mod terminal;
 #[cfg(target_os = "macos")]
 pub mod tools;

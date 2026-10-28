@@ -145,7 +145,7 @@ pub struct WindowKeyScope {
 /// document is key again. When the previous key window was such a dialog it
 /// is gone now, so key goes to the frontmost window that was on screen
 /// before: its document, which brings the dialog and the window order back.
-fn restore_target(
+pub(crate) fn restore_target(
     target: u32,
     previous: Option<u32>,
     order_before: &[u32],
@@ -158,7 +158,7 @@ fn restore_target(
 }
 
 /// `pid`'s on-screen layer-0 windows, front to back.
-fn app_window_order(pid: pid_t) -> Vec<u32> {
+pub(crate) fn app_window_order(pid: pid_t) -> Vec<u32> {
     let mut windows: Vec<_> = crate::windows::visible_windows()
         .into_iter()
         .filter(|w| w.pid == pid && w.layer == 0 && w.is_on_screen)
@@ -1027,45 +1027,54 @@ pub fn activate_without_raise_with(
     defocus_ok && focus_ok
 }
 
-/// Reverse [`activate_without_raise`] once a background click is delivered:
-/// defocus `target_wid` and hand key focus back to `previous_pid`'s key window.
-///
-/// The no-raise recipe posts a defocus record to the user's front process.
-/// That process stays frontmost as far as NSWorkspace reports, but its key
-/// window stops receiving keyboard input until the user clicks it again, so
-/// the activation-based restore never fires. Returns `true` when both posts
-/// succeeded.
-pub fn restore_focus_after_without_raise(
-    previous_pid: pid_t,
-    previous_key_wid: Option<u32>,
-    target_pid: pid_t,
-    target_wid: u32,
-) -> bool {
-    let Some(post_fn) = post_event_record_to_fn() else {
+/// Post one AppKit-defined notice (type 13) to the process that owns
+/// `target_wid`, and to no other process: `subtype` 1 tells the app it became
+/// active, 2 that it resigned active. AppKit posts `didBecomeActive` /
+/// `didResignActive` on it and, for 2, resigns its key and main window.
+/// WindowServer's front process and key-focus process do not change.
+fn post_app_notice(target_pid: pid_t, target_wid: u32, subtype: u8) -> bool {
+    let Some(post) = post_event_record_to_fn() else {
         return false;
     };
-    let Some(previous_wid) = previous_key_wid.or_else(|| key_window_of_pid(previous_pid)) else {
-        return false;
-    };
-    let mut previous_psn = [0u8; 8];
-    let mut target_psn = [0u8; 8];
-    if !get_process_psn_for_window(previous_wid, previous_pid, &mut previous_psn)
-        || !get_process_psn_for_window(target_wid, target_pid, &mut target_psn)
-    {
+    let mut psn = [0u8; 8];
+    if !get_process_psn_for_window(target_wid, target_pid, &mut psn) {
         return false;
     }
+    let mut record = focus_record(target_wid);
+    record[0x8A] = subtype;
+    note_post_status(unsafe { post(psn.as_ptr() as *const c_void, record.as_ptr()) })
+}
 
-    let mut buf = focus_record(target_wid);
-    buf[0x8A] = 0x02;
-    let defocus_ok =
-        note_post_status(unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) });
+/// Tell `target_pid` it became active (type 13, subtype 1) for `target_wid`.
+/// The app then believes `NSApp.isActive`; no window becomes key by this
+/// alone (see [`post_make_key_records`]).
+pub fn post_activation_notice(target_pid: pid_t, target_wid: u32) -> bool {
+    post_app_notice(target_pid, target_wid, 0x01)
+}
 
-    let mut buf = focus_record(previous_wid);
-    buf[0x8A] = 0x01;
-    let focus_ok =
-        note_post_status(unsafe { post_fn(previous_psn.as_ptr() as *const c_void, buf.as_ptr()) });
+/// Tell `target_pid` it resigned active (type 13, subtype 2). AppKit resigns
+/// the key and main window and `NSApp.isActive` becomes false in one step.
+pub fn post_deactivation_notice(target_pid: pid_t, target_wid: u32) -> bool {
+    post_app_notice(target_pid, target_wid, 0x02)
+}
 
-    defocus_ok && focus_ok
+/// Post the make-key record pair (types 0x01/0x02) for `target_wid` to its
+/// process only. In an app that believes it is active, AppKit makes that
+/// window main and key.
+pub fn post_make_key_records(target_pid: pid_t, target_wid: u32) -> bool {
+    let Some(post) = post_event_record_to_fn() else {
+        return false;
+    };
+    let mut psn = [0u8; 8];
+    if !get_process_psn_for_window(target_wid, target_pid, &mut psn) {
+        return false;
+    }
+    let mut ok = true;
+    for event_kind in [0x01, 0x02] {
+        let record = make_key_window_record(target_wid, event_kind);
+        ok &= note_post_status(unsafe { post(psn.as_ptr() as *const c_void, record.as_ptr()) });
+    }
+    ok
 }
 
 /// The 248-byte focus/defocus event record with `wid` stamped little-endian at

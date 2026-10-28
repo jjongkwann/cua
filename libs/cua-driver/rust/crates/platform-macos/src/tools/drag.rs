@@ -19,9 +19,9 @@ use std::sync::Arc;
 
 use super::ToolState;
 use crate::apps;
-use crate::focus_guard;
+use crate::focus_guard::{self, FocusPolicy};
 use crate::input::mouse::DragButton;
-use crate::window_change_detector::WindowChangeDetector;
+use crate::synthetic_focus::{Binding, Report};
 
 pub struct DragTool {
     pub state: Arc<ToolState>,
@@ -348,26 +348,24 @@ impl Tool for DragTool {
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Drags can trigger drag-and-drop side-effects that spawn helper
         // windows (drop on Dock, drop on background app icon). In the
-        // background the target itself may become AppKit-active without
-        // raising; anything else that takes focus is reported and undone.
+        // background the target is synthetically active for the gesture, as
+        // for a background pixel click, and told to resign afterwards;
+        // anything else that takes focus is reported and undone. Neither mode
+        // suppresses the target itself: foreground deliberately activates it
+        // for the HID gesture.
+        let policy = if fg {
+            FocusPolicy::Foreground
+        } else {
+            FocusPolicy::Synthetic {
+                window_id: wid,
+                binding: Binding::Active,
+            }
+        };
         let prior_front = apps::frontmost_pid();
-        let snapshot = if fg {
-            WindowChangeDetector::snapshot(prior_front)
-        } else {
-            WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
-        };
+        let snapshot = policy.snapshot(prior_front, pid);
 
-        // Background prologue, as for a background pixel click: keep the
-        // user's key focus if the gesture opens a menu, remember their key
-        // window, and make the target window AppKit-key without raising it.
-        let _key_focus = if fg {
-            None
-        } else {
-            tokio::task::spawn_blocking(move || crate::key_focus_guard::protect(pid))
-                .await
-                .ok()
-                .flatten()
-        };
+        // The user's key window, read before the gesture, so the restore
+        // below hands key status back to exactly that window.
         let prior_key_wid = match prior_front {
             Some(prior) if !fg && prior != pid => tokio::task::spawn_blocking(move || {
                 crate::input::skylight::key_window_of_pid(prior)
@@ -377,126 +375,122 @@ impl Tool for DragTool {
             .flatten(),
             _ => None,
         };
-        let focus_without_raise = if fg {
-            false
-        } else {
-            match tokio::task::spawn_blocking(move || {
-                crate::input::mouse::prepare_background_pixel_click(pid, wid)
-            })
-            .await
-            {
-                Ok(activated) => {
-                    if !activated && crate::input::skylight::windowserver_connection_invalid() {
-                        return super::windowserver_connection_refusal(pid, Some(wid));
-                    }
-                    crate::cursor::overlay::send_command(
-                        cursor_key.clone(),
-                        cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                    );
-                    activated
-                }
-                Err(error) => {
-                    return ToolResult::error(format!(
-                        "Background drag activation task failed: {error}"
-                    ))
-                }
-            }
-        };
 
         // Dispatch blocking drag synthesis.
         let mods_owned = modifiers.clone();
         let cursor_for_drag = cursor_key.clone();
+        let overlay_key = cursor_key.clone();
         crate::cursor::overlay::send_command(
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(true),
         );
-        let result = focus_guard::with_focus_suppressed(
-            // Neither mode suppresses the target: foreground deliberately
-            // activates it for the HID gesture, and background lets the
-            // no-raise prologue make it active; the restore below hands focus
-            // back. Other apps that take focus are still suppressed.
-            None,
-            prior_front,
-            "drag.CGEvent",
-            || async move {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-                    let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                    let observe = move |x: f64, y: f64| {
-                        crate::cursor::overlay::send_command(
-                            cursor_for_drag.clone(),
-                            cursor_overlay::track_pointer_command(x, y),
-                        );
-                    };
-                    if fg {
-                        // Keep the exact target window active for the
-                        // complete HID gesture, then restore the prior
-                        // front process.
-                        return crate::input::skylight::with_foreground_hid_activation(
-                            pid as libc::pid_t,
-                            wid,
-                            || {
-                                crate::input::mouse::drag_at_xy_observed(
-                                    pid,
-                                    from_sx,
-                                    from_sy,
-                                    to_sx,
-                                    to_sy,
-                                    Some((from_lx, from_ly)),
-                                    Some((to_lx, to_ly)),
-                                    Some(wid),
-                                    duration_ms,
-                                    steps,
-                                    &m,
-                                    button,
-                                    true,
-                                    observe,
-                                )?;
-                                // Hold the front until AppKit finishes the
-                                // drop: restoring the previous app while the
-                                // session is still open cancels it.
-                                await_drag_session_end(pid);
-                                Ok(())
-                            },
-                        )
-                        .map(|()| false);
-                    }
-                    // A drag that starts a system drag-and-drop session
-                    // (list reordering, file drags, HTML5 draggable) is
-                    // tracked by macOS with the hardware pointer, so the
-                    // drop cannot land at the requested point. AppKit shows
-                    // the drag image in a window of the target at the
-                    // dragging level; when one appears, release at once so
-                    // the session ends where the user's pointer is not
-                    // moving, and report it.
-                    let before = drag_image_windows(pid);
-                    let mut session_seen = false;
-                    let outcome = crate::input::mouse::drag_at_xy_background(
-                        pid,
-                        (from_sx, from_sy),
-                        (to_sx, to_sy),
-                        wid,
-                        duration_ms,
-                        steps,
-                        &m,
-                        button,
-                        observe,
-                        || {
-                            session_seen = !drag_image_windows(pid).is_subset(&before);
-                            !session_seen
-                        },
-                    )?;
-                    let session = session_seen
-                        || !drag_image_windows(pid).is_subset(&before)
-                        || matches!(
-                            outcome,
-                            crate::input::mouse::BackgroundDragOutcome::StoppedEarly { .. }
-                        );
-                    Ok(session)
-                })
+        let drag = move || -> anyhow::Result<bool> {
+            // Re-pin after the binding, which can disturb overlay
+            // ordering.
+            crate::cursor::overlay::send_command(
+                overlay_key,
+                cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+            );
+            let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
+            let observe = move |x: f64, y: f64| {
+                crate::cursor::overlay::send_command(
+                    cursor_for_drag.clone(),
+                    cursor_overlay::track_pointer_command(x, y),
+                );
+            };
+            if fg {
+                // Keep the exact target window active for the
+                // complete HID gesture, then restore the prior
+                // front process.
+                return crate::input::skylight::with_foreground_hid_activation(
+                    pid as libc::pid_t,
+                    wid,
+                    || {
+                        crate::input::mouse::drag_at_xy_observed(
+                            pid,
+                            from_sx,
+                            from_sy,
+                            to_sx,
+                            to_sy,
+                            Some((from_lx, from_ly)),
+                            Some((to_lx, to_ly)),
+                            Some(wid),
+                            duration_ms,
+                            steps,
+                            &m,
+                            button,
+                            true,
+                            observe,
+                        )?;
+                        // Hold the front until AppKit finishes the
+                        // drop: restoring the previous app while the
+                        // session is still open cancels it.
+                        await_drag_session_end(pid);
+                        Ok(())
+                    },
+                )
+                .map(|()| false);
+            }
+            // A drag that starts a system drag-and-drop session
+            // (list reordering, file drags, HTML5 draggable) is
+            // tracked by macOS with the hardware pointer, so the
+            // drop cannot land at the requested point. AppKit shows
+            // the drag image in a window of the target at the
+            // dragging level; when one appears, release at once so
+            // the session ends where the user's pointer is not
+            // moving, and report it.
+            let before = drag_image_windows(pid);
+            let mut session_seen = false;
+            let outcome = crate::input::mouse::drag_at_xy_background(
+                pid,
+                (from_sx, from_sy),
+                (to_sx, to_sy),
+                wid,
+                duration_ms,
+                steps,
+                &m,
+                button,
+                observe,
+                || {
+                    session_seen = !drag_image_windows(pid).is_subset(&before);
+                    !session_seen
+                },
+            )?;
+            let session = session_seen
+                || !drag_image_windows(pid).is_subset(&before)
+                || matches!(
+                    outcome,
+                    crate::input::mouse::BackgroundDragOutcome::StoppedEarly { .. }
+                );
+            Ok(session)
+        };
+        let (result, focus) = match policy {
+            FocusPolicy::Synthetic { window_id, binding } => {
+                match focus_guard::with_synthetic_focus(
+                    pid,
+                    window_id,
+                    binding,
+                    "drag.CGEvent",
+                    None,
+                    drag,
+                )
                 .await
-            },
-        )
-        .await;
+                {
+                    Ok(guarded) => (Ok(guarded.result), guarded.focus),
+                    Err(error) => (Err(error), Report::default()),
+                }
+            }
+            _ => (
+                focus_guard::with_focus_suppressed(
+                    policy.suppressed_target(pid),
+                    prior_front,
+                    "drag.CGEvent",
+                    || async move { tokio::task::spawn_blocking(drag).await },
+                )
+                .await,
+                Report::default(),
+            ),
+        };
         crate::cursor::overlay::send_command(
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::SetPressed(false),
@@ -513,7 +507,7 @@ impl Tool for DragTool {
                 prior_front,
                 prior_key_wid,
                 window_id,
-                focus_without_raise,
+                focus.synthetic,
             )
             .await;
         }
@@ -576,8 +570,14 @@ impl Tool for DragTool {
                 "delivery_mode": if fg { "foreground" } else { "background" },
                 "verified": false,
                 "effect": "unverifiable",
-                "focus_without_raise": focus_without_raise
+                "focus_without_raise": focus.synthetic
             })),
+            Ok(Err(e))
+                if e.downcast_ref::<crate::synthetic_focus::Refusal>()
+                    == Some(&crate::synthetic_focus::Refusal::WindowServerConnection) =>
+            {
+                super::windowserver_connection_refusal(pid, Some(wid))
+            }
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
