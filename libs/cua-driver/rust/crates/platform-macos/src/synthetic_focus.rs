@@ -28,16 +28,31 @@
 //!   main window before any record, so they confirm a binding only together
 //!   with `AXFrontmost`; a sibling window shows up in them once bound.
 //!
+//! - Key events posted to the process with the window in their routing
+//!   fields reach that window's first responder while the app is inactive
+//!   and has no key window (the fixture's text field took type_text,
+//!   type_text_chars, press_key and a shift+m hotkey that way). VCL
+//!   (LibreOffice) instead routes keys to its focused window and drops them
+//!   while it has no focused element (CUA-1767), so keys need a binding only
+//!   when the app's focused window is not the requested one or it has no
+//!   focused element.
+//!
 //! ## Lifecycle
 //!
 //! [`enter`] validates that the window belongs to the pid, sends the
-//! activation notice and, for [`Binding::Key`] and [`Binding::KeyMain`], the
-//! make-key pair, then reads the app's state back until it reports the
-//! binding. An unconfirmed key binding is undone and refused: the caller
-//! dispatches nothing. Dropping the returned [`TargetFocus`] restores the
-//! window that was focused before (when it changed and still exists) and
-//! sends the deactivation notice, unless the target has really come to the
-//! front in the meantime (then it is the user's, and left alone).
+//! activation notice and, for [`Binding::Key`], [`Binding::KeyMain`] and
+//! [`Binding::Keys`], the make-key pair, then reads the app's state back
+//! until it reports the binding. An unconfirmed key binding is undone and
+//! refused: the caller dispatches nothing. Dropping the returned
+//! [`TargetFocus`] restores the window that was focused before (when it
+//! changed and still exists) and sends the deactivation notice, unless the
+//! target has really come to the front in the meantime (then it is the
+//! user's, and left alone).
+//!
+//! A [`Binding::Keys`] request for a window that already routes keys sends
+//! nothing. For a target the user has in front it switches the app's key
+//! window in place, as a foreground key post would, and switches it back
+//! without telling the front app to resign.
 //!
 //! Every record goes to the target process; nothing is sent to the user's
 //! app. The type-21 key-focus notices are not used here: no path in the
@@ -73,6 +88,11 @@ pub enum Binding {
     /// `window` is the app's key and main window: the document context
     /// AppKit resolves window and document menus against.
     KeyMain,
+    /// Keys posted to the process reach `window`. Nothing is sent when the
+    /// app's focused window is `window` and it has a focused element (AppKit
+    /// routes posted keys by window; VCL to its focused window); otherwise
+    /// `window` is bound as for [`Binding::Key`].
+    Keys,
 }
 
 impl Binding {
@@ -81,6 +101,7 @@ impl Binding {
             Binding::Active => "active",
             Binding::Key => "key window",
             Binding::KeyMain => "key and main window",
+            Binding::Keys => "key window for posted keys",
         }
     }
 }
@@ -94,6 +115,9 @@ pub struct TargetState {
     pub focused: Option<u32>,
     /// `AXMainWindow`.
     pub main: Option<u32>,
+    /// The window holding `AXFocusedUIElement`. `None` for an app with no
+    /// focused element, such as a LibreOffice that has never been active.
+    pub element: Option<u32>,
 }
 
 impl TargetState {
@@ -101,9 +125,18 @@ impl TargetState {
         self.frontmost == Some(true)
             && match binding {
                 Binding::Active => true,
-                Binding::Key => self.focused == Some(window),
+                Binding::Key | Binding::Keys => self.focused == Some(window),
                 Binding::KeyMain => self.focused == Some(window) && self.main == Some(window),
             }
+    }
+
+    /// Keys posted to the process already reach `window`: it is the app's
+    /// focused window and something in the app has focus. The predictor
+    /// measured on LibreOffice (keys went to `AXFocusedWindow` in every
+    /// trial) and seen on AppKit (an inactive app with no key window took
+    /// keys into the focused window's first responder).
+    fn routes_keys(self, window: u32) -> bool {
+        self.focused == Some(window) && self.element.is_some()
     }
 }
 
@@ -241,6 +274,7 @@ impl Host for Live {
                 frontmost: copy_bool_attr(app, "AXFrontmost"),
                 focused: window_id("AXFocusedWindow"),
                 main: window_id("AXMainWindow"),
+                element: crate::ax::bindings::focused_element_window_id_of_pid(pid),
             };
             core_foundation::base::CFRelease(app as _);
             state
@@ -285,6 +319,8 @@ enum Passive {
     Unavailable,
     /// The app already believes it is active and only that was asked.
     AlreadyActive,
+    /// Keys posted to the process already reach the window.
+    AlreadyRoutes,
 }
 
 /// A bound target.
@@ -298,6 +334,9 @@ struct Bound {
     /// The app's on-screen windows before binding, front to back.
     order_before: Vec<u32>,
     confirmed: bool,
+    /// The target was the front process when bound: its key window was
+    /// switched in place, and it is not told to resign on exit.
+    in_front: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -325,7 +364,10 @@ fn enter_with<H: Host>(
     binding: Binding,
 ) -> Result<Entered, Refusal> {
     let front_before = host.front_process();
-    if front_before == Some(pid) {
+    let in_front = front_before == Some(pid);
+    // A target the user has in front is active for real. Only a key post may
+    // still need its key window switched inside the app.
+    if in_front && binding != Binding::Keys {
         return Ok(Entered::Passive(Passive::TargetInFront));
     }
     if !host.available() {
@@ -339,12 +381,15 @@ fn enter_with<H: Host>(
     if binding == Binding::Active && before.frontmost == Some(true) {
         return Ok(Entered::Passive(Passive::AlreadyActive));
     }
+    if binding == Binding::Keys && before.routes_keys(window) {
+        return Ok(Entered::Passive(Passive::AlreadyRoutes));
+    }
     let order_before = host.window_order(pid);
     let mut posted = true;
     if before.frontmost == Some(true) {
-        // The app already believes it is active (an earlier action left it
-        // so). The make-key pair binds a window only while the app goes
-        // active, so have it resign first.
+        // The app already believes it is active (it is in front, or an
+        // earlier action left it so). The make-key pair binds a window only
+        // while the app goes active, so have it resign first.
         posted &= host.post_deactivation(pid, before.focused.unwrap_or(window));
         host.settle(RECORD_SETTLE);
     }
@@ -363,10 +408,11 @@ fn enter_with<H: Host>(
         previous: before.focused,
         order_before,
         confirmed: false,
+        in_front,
     };
     let budget = match binding {
         Binding::Active => ACTIVE_READBACK,
-        Binding::Key | Binding::KeyMain => KEY_READBACK,
+        Binding::Key | Binding::KeyMain | Binding::Keys => KEY_READBACK,
     };
     let max_polls = (budget.as_millis() / READBACK_POLL.as_millis()) as u32;
     let mut state = host.target_state(pid);
@@ -400,10 +446,12 @@ fn enter_with<H: Host>(
 }
 
 /// Hand the activation back: the previous key window first, when the binding
-/// moved it and it still exists, then the deactivation notice. Nothing when
-/// the target has really come to the front: that is the user's doing.
+/// moved it and it still exists, then the deactivation notice. A target that
+/// was in front when bound keeps its activation and only gets its key window
+/// back. Nothing when the target has come to the front since: that is the
+/// user's doing.
 fn exit_bound<H: Host>(host: &mut H, bound: &Bound) {
-    if host.front_process() == Some(bound.pid) {
+    if !bound.in_front && host.front_process() == Some(bound.pid) {
         tracing::debug!(
             pid = bound.pid,
             window = bound.window,
@@ -424,15 +472,19 @@ fn exit_bound<H: Host>(host: &mut H, bound: &Bound) {
     match restore {
         Some(previous) => {
             // The pair binds a window only while the app goes active: resign,
-            // activate naming the previous window, bind it, resign for good.
+            // activate naming the previous window, bind it, then resign for
+            // good unless the app is in front for real.
             host.post_deactivation(bound.pid, bound.window);
             host.settle(RECORD_SETTLE);
             host.post_activation(bound.pid, previous);
             host.settle(RECORD_SETTLE);
             host.post_make_key(bound.pid, previous);
-            host.settle(RECORD_SETTLE);
-            host.post_deactivation(bound.pid, previous);
+            if !bound.in_front {
+                host.settle(RECORD_SETTLE);
+                host.post_deactivation(bound.pid, previous);
+            }
         }
+        None if bound.in_front => {}
         None => {
             host.post_deactivation(bound.pid, bound.window);
         }
@@ -440,16 +492,12 @@ fn exit_bound<H: Host>(host: &mut H, bound: &Bound) {
 }
 
 /// Run `f` with `window` bound for `pid`: key-focus guard, bind, `f`,
-/// release. `f` does not run when the binding is refused. With
-/// `leave_to_owner` the binding is not released afterwards: an enclosing
-/// background action on the same process owns the target's focus for its
-/// own remaining steps.
+/// release. `f` does not run when the binding is refused.
 pub(crate) fn run_with<H: Host, T, E: From<Refusal>>(
     host: &mut H,
     pid: i32,
     window: u32,
     binding: Binding,
-    leave_to_owner: bool,
     f: impl FnOnce() -> Result<T, E>,
 ) -> (Report, Result<T, E>) {
     let key_focus = host.protect_key_focus(pid);
@@ -460,9 +508,7 @@ pub(crate) fn run_with<H: Host, T, E: From<Refusal>>(
     let report = entered.report();
     let result = f();
     if let Entered::Bound(bound) = &entered {
-        if !leave_to_owner {
-            exit_bound(host, bound);
-        }
+        exit_bound(host, bound);
     }
     drop(key_focus);
     (report, result)
@@ -533,7 +579,8 @@ pub(crate) mod fake {
 
     impl Script {
         /// A background target whose state follows every record: inactive
-        /// with `main` focused, then bound to whatever was last activated.
+        /// with `main` focused and a focused element in it, then bound to
+        /// whatever was last activated.
         pub fn background(owner: i32, main: u32) -> Script {
             Script {
                 available: true,
@@ -543,6 +590,7 @@ pub(crate) mod fake {
                     frontmost: Some(false),
                     focused: Some(main),
                     main: Some(main),
+                    element: Some(main),
                 }]),
                 order: vec![main],
                 posts_succeed: true,
@@ -639,6 +687,7 @@ pub(crate) mod fake {
             if self.follow_records {
                 self.live.focused = Some(window);
                 self.live.main = Some(window);
+                self.live.element = Some(window);
             }
             self.script.posts_succeed
         }
@@ -669,7 +718,7 @@ mod tests {
         binding: Binding,
     ) -> (Report, Result<&'static str, Refusal>) {
         let ops = fake.ops.clone();
-        run_with(fake, TARGET, window, binding, false, || {
+        run_with(fake, TARGET, window, binding, || {
             ops.lock().unwrap().push(Op::Dispatch);
             Ok("dispatched")
         })
@@ -679,7 +728,7 @@ mod tests {
     fn a_key_main_binding_sends_its_records_to_the_target_only_and_in_order() {
         let mut fake = Fake::new(Script::background(TARGET, MAIN));
         let ops = fake.ops.clone();
-        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::KeyMain, false, || {
+        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::KeyMain, || {
             ops.lock().unwrap().push(Op::Dispatch);
             Ok::<_, Refusal>(())
         });
@@ -708,7 +757,7 @@ mod tests {
         let mut fake = Fake::new(Script::background(TARGET, MAIN));
         fake.follow_records = false;
         let ops = fake.ops.clone();
-        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::Active, false, || {
+        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::Active, || {
             ops.lock().unwrap().push(Op::Dispatch);
             Ok::<_, Refusal>(())
         });
@@ -737,7 +786,7 @@ mod tests {
         // The app never reports the binding (a sheet holds its key status).
         fake.follow_records = false;
         let ops = fake.ops.clone();
-        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::Key, false, || {
+        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::Key, || {
             ops.lock().unwrap().push(Op::Dispatch);
             Ok::<_, Refusal>(())
         });
@@ -750,6 +799,7 @@ mod tests {
                     frontmost: Some(false),
                     focused: Some(MAIN),
                     main: Some(MAIN),
+                    element: Some(MAIN),
                 },
             })
         );
@@ -909,6 +959,7 @@ mod tests {
             frontmost: Some(true),
             focused: Some(MAIN),
             main: Some(MAIN),
+            element: Some(MAIN),
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -934,6 +985,7 @@ mod tests {
             frontmost: Some(true),
             focused: Some(MAIN),
             main: Some(MAIN),
+            element: Some(MAIN),
         }]
         .into();
         let mut fake = Fake::new(script);
@@ -944,23 +996,116 @@ mod tests {
     }
 
     #[test]
-    fn leaving_the_binding_to_the_owner_skips_the_release() {
+    fn keys_to_the_window_that_already_routes_them_send_nothing() {
         let mut fake = Fake::new(Script::background(TARGET, MAIN));
-        let ops = fake.ops.clone();
-        let (report, result) = run_with(&mut fake, TARGET, MAIN, Binding::Active, true, || {
-            ops.lock().unwrap().push(Op::Dispatch);
-            Ok::<_, Refusal>(())
-        });
-        assert_eq!(result, Ok(()));
-        assert!(report.synthetic);
+        let (report, result) = run(&mut fake, MAIN, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert_eq!(report, Report::default());
+        assert_eq!(fake.ops(), vec![Op::ProtectKeyFocus(TARGET), Op::Dispatch]);
+    }
+
+    #[test]
+    fn keys_to_an_app_without_a_focused_element_bind_the_window_and_release_it() {
+        // A LibreOffice that has never been active: focused window, no
+        // focused element, drops every key until bound.
+        let mut script = Script::background(TARGET, MAIN);
+        script.states = [TargetState {
+            frontmost: Some(false),
+            focused: Some(MAIN),
+            main: Some(MAIN),
+            element: None,
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, MAIN, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.synthetic && report.confirmed);
         assert_eq!(
             fake.ops(),
             vec![
                 Op::ProtectKeyFocus(TARGET),
                 Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
                 Op::Dispatch,
+                Op::Deactivation(TARGET, MAIN),
             ]
         );
+    }
+
+    #[test]
+    fn keys_to_a_sibling_window_bind_it_and_restore_the_previous_one() {
+        let mut script = Script::background(TARGET, MAIN);
+        script.order = vec![MAIN, SIBLING];
+        let mut fake = Fake::new(script);
+        let (_, result) = run(&mut fake, SIBLING, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, SIBLING),
+                Op::MakeKey(TARGET, SIBLING),
+                Op::Dispatch,
+                Op::Deactivation(TARGET, SIBLING),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::Deactivation(TARGET, MAIN),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_to_a_front_targets_other_window_switch_key_in_place_and_switch_back() {
+        let mut script = Script::background(TARGET, MAIN);
+        script.fronts = [Some(TARGET)].into();
+        script.order = vec![MAIN, SIBLING];
+        script.states = [TargetState {
+            frontmost: Some(true),
+            focused: Some(MAIN),
+            main: Some(MAIN),
+            element: Some(MAIN),
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, SIBLING, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.synthetic && report.confirmed);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                // In place: resign, activate naming the sibling, bind it.
+                Op::Deactivation(TARGET, MAIN),
+                Op::Activation(TARGET, SIBLING),
+                Op::MakeKey(TARGET, SIBLING),
+                Op::Dispatch,
+                // Back to the previous window; the front app is not told to
+                // resign at the end.
+                Op::Deactivation(TARGET, SIBLING),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+            ],
+            "{:?}",
+            fake.ops()
+        );
+    }
+
+    #[test]
+    fn keys_to_a_front_targets_routing_window_send_nothing() {
+        let mut script = Script::background(TARGET, MAIN);
+        script.fronts = [Some(TARGET)].into();
+        script.states = [TargetState {
+            frontmost: Some(true),
+            focused: Some(MAIN),
+            main: Some(MAIN),
+            element: Some(MAIN),
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, MAIN, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert_eq!(report, Report::default());
+        assert_eq!(fake.ops(), vec![Op::ProtectKeyFocus(TARGET), Op::Dispatch]);
     }
 
     #[test]
@@ -981,11 +1126,21 @@ mod tests {
             frontmost: Some(true),
             focused: Some(MAIN),
             main: Some(SIBLING),
+            element: None,
         };
         assert!(bound.satisfies(MAIN, Binding::Active));
         assert!(bound.satisfies(MAIN, Binding::Key));
+        assert!(bound.satisfies(MAIN, Binding::Keys));
         assert!(!bound.satisfies(MAIN, Binding::KeyMain));
         assert!(!bound.satisfies(SIBLING, Binding::Key));
+        // Routing needs a focused element, not an active app.
+        assert!(!bound.routes_keys(MAIN));
+        assert!(TargetState {
+            frontmost: Some(false),
+            element: Some(MAIN),
+            ..bound
+        }
+        .routes_keys(MAIN));
         let inactive = TargetState {
             frontmost: Some(false),
             ..bound

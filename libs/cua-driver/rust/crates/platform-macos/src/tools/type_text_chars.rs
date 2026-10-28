@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use super::ToolState;
+use crate::synthetic_focus::Refusal;
 
 pub struct TypeTextCharsTool {
     state: Arc<ToolState>,
@@ -86,7 +87,7 @@ impl Tool for TypeTextCharsTool {
         // transport with no semantic AX rung. A window-addressed request must
         // prove exact delivery before any event is posted; there is no
         // semantic fallback here, so a refusal is final.
-        let _mutation_lease = if let Some(wid) = window_id {
+        let mut _mutation_lease = if let Some(wid) = window_id {
             match super::gate_background_window_action(
                 pid,
                 wid,
@@ -104,11 +105,6 @@ impl Tool for TypeTextCharsTool {
             None
         };
 
-        let _key_scope = match super::acquire_key_scope(pid, window_id, false).await {
-            Ok(scope) => scope,
-            Err(refusal) => return refusal,
-        };
-
         // Pre-focus element if requested.
         if !type_chars_only {
             if let Some(guard) = element_guard.as_ref().cloned() {
@@ -121,13 +117,30 @@ impl Tool for TypeTextCharsTool {
         }
         drop(element_guard);
 
+        // A window-addressed post goes out with that window bound as the
+        // app's key-routing window (synthetic_focus, Binding::Keys),
+        // confirmed, or refuses (window_not_key); the binding, the keys and
+        // the release share one blocking thread with the mutation lease.
         let text_len = text.chars().count();
-        let result = tokio::task::spawn_blocking(move || {
-            crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
-        })
+        let policy = super::keyboard_focus_policy(window_id, false);
+        let result = crate::focus_guard::run_blocking_under(
+            pid,
+            crate::apps::frontmost_pid(),
+            policy,
+            "type_text_chars.CGEvent",
+            &mut _mutation_lease,
+            move || crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms),
+        )
         .await;
 
         match result {
+            Ok(Err(e)) if e.downcast_ref::<Refusal>().is_some() && window_id.is_some() => {
+                super::synthetic_focus_refusal(
+                    pid,
+                    window_id.unwrap_or_default(),
+                    e.downcast_ref::<Refusal>().expect("checked"),
+                )
+            }
             Ok(Ok(())) => ToolResult::text(format!(
                 "Typed {text_len} character(s) with {delay_ms}ms delay."
             )),

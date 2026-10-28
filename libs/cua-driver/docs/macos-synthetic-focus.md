@@ -53,6 +53,16 @@ its own and in sequences, several runs each, on macOS 27.0 (Darwin 27.0.0).
    activation step; three repeats with the same steps did not reproduce it,
    and the process that had been in front no longer existed, so it is taken
    as the user switching apps.
+8. Key events posted to the process with the window in their routing fields
+   (`type_text`, `type_text_chars`, `press_key`, a shift+m `hotkey`) reached
+   the fixture's text field while the fixture was inactive and had no key
+   window: the journal shows each key-down in the main window with the field
+   editor (`NSTextView`) as responder, `is_active=false`, `key_window=0`, and
+   the field read the typed text back. A key addressed to the sibling window
+   (a label, nothing editable) reached that window (`NSWindow` responder) and
+   not the text field. The driver's earlier key-window primer sent no
+   records in the first four cases, because the main window was already the
+   app's focused window with a focused element.
 
 Before this change, the driver's primers sent the activation notice and
 never a deactivation: a background `invoke_menu`, a disabled item, and a
@@ -76,6 +86,12 @@ window (`background_focus_oracle` against ded0c1748).
   driver path removes the target's key focus during a synthetic binding, so
   it is not sent. If a future path does, `key_focus_guard` is where the
   removal is seen.
+- Posted keys reach the app's focused window: AppKit routes them by the
+  window in the event, VCL (LibreOffice) to its focused window and nowhere
+  while it has no focused element (CUA-1767). `AXFocusedWindow` plus a focused
+  element is therefore taken as "the window already routes keys", the
+  predictor the earlier primer used; it was measured on LibreOffice and seen
+  on AppKit (fact 8), not on other toolkits.
 
 ## Implementation choices
 
@@ -102,11 +118,27 @@ window (`background_focus_oracle` against ded0c1748).
   lease) leaves the binding to its owner.
 - The OS calls sit behind a `Host` trait so hermetic tests check the record
   order and addressing without a window server.
-- Callers in this change: `invoke_menu` background (`KeyMain`, both exact
-  focused/main checks kept), `hotkey`'s menu-equivalent route (through
-  `invoke_menu`), a background `AXPress` in a native app (`Key`), and a
-  background left pixel `click` and `drag` (`Active`). The ad-hoc primers
-  they replaced are removed.
+- Callers: `invoke_menu` background (`KeyMain`, both exact focused/main
+  checks kept), `hotkey`'s menu-equivalent route (through `invoke_menu`), a
+  background `AXPress` in a native app (`Key`), a background left pixel
+  `click` and `drag` (`Active`), and the key tools (`press_key`, `hotkey`'s
+  key post, `type_text`, `type_text_chars`, `set_value` type-ahead) with
+  `Keys`. The ad-hoc primers and the earlier key-window scope
+  (`WindowKeyScope`, `prime_exact_window_key`, `key_scope`) are removed.
+- `Keys` sends nothing when the window already routes keys (fact 8 and the
+  hypothesis above), so the common background key post stays record-free, as
+  it was; otherwise it binds as `Key` does and refuses unconfirmed
+  (`window_not_key`). The earlier primer's `AXFocusedWindow` write fallback is
+  gone: that write does not make a window key, and a binding that only it
+  could satisfy was never proven to route keys. For a target the user has in
+  front, `Keys` switches the app's key window in place (deactivation notice,
+  activation notice naming the window, pair), as the earlier primer did, and
+  switches it back without telling the front app to resign.
+- The key tools run their key post on the blocking thread that holds the
+  binding and the per-PID lease (`focus_guard::run_blocking_under`), so a
+  dropped caller future still releases the binding after the keys. A key
+  tool's pixel focus click runs before that, as a nested `click`, and binds
+  and releases its own `Active` context.
 
 ## Verified
 
@@ -116,20 +148,30 @@ window (`background_focus_oracle` against ded0c1748).
   Arrange Left runs exactly once with the fixture active and its window key;
   a sibling binding and an action-less item refuse `background_unavailable`;
   a window a sheet keeps from being key refuses `window_not_key`; an
-  `AXPress` increments once; every activation is paired with a resignation;
-  the user's front process, key focus, focused window and window order are
-  unchanged throughout.
+  `AXPress` increments once; `type_text`, `type_text_chars`, `press_key` and a
+  shift+m `hotkey` land in the text field with no record sent; a `press_key`
+  addressed to the sibling window binds it, reaches only it, restores the
+  main window and ends inactive; every activation is paired with a
+  resignation; the user's front process, key focus, focused window and window
+  order are unchanged throughout.
 
 ## Not verified
 
 - The full cross-platform desktop E2E matrix and
   `harness_appkit_invoke_menu_live_path` (its expectation was flipped from
   the oracle evidence; it needs the canonical macOS runner).
-- Keyboard tools (`press_key`, `hotkey` key posting, `type_text`,
-  `type_text_chars`), `set_value` type-ahead, `document_edit` and the
-  browser setup path still use the earlier primitives (`WindowKeyScope`,
-  `prepare_background_pixel_click`), which send the activation notice
-  without a deactivation. They are the next callers to move.
+- `document_edit` and the browser setup path (`setup_ui`) still use the
+  earlier primitive (`activate_without_raise_with`,
+  `prepare_background_pixel_click`), which sends the activation notice
+  without a deactivation; neither can be verified here (TextEdit with
+  Automation, a browser). They are the next callers to move.
+- The key tools' pixel focus click (`x,y` on `type_text`, `press_key`,
+  `hotkey`): its window frame proof takes a window capture, which needs
+  Screen Recording here. The hermetic tests cover the sequence (the nested
+  click releases its `Active` binding before the key binding starts).
+- `Keys` on a LibreOffice that has never been active (the case the binding
+  exists for) and on a front target's other window, beyond the hermetic
+  sequence tests.
 - Chromium, Electron and Catalyst targets under the `Active` binding beyond
   what the pixel prologue already did; Space preservation; what AppKit keys
   on the user's next real activation of a target whose key window the driver

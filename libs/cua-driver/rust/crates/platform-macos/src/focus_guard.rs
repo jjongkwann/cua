@@ -34,6 +34,8 @@
 //!   dropped mid-action (a script timeout) still gets the restore and the
 //!   readback before the lease is released, and the next action on that
 //!   process waits for it.
+//! - [`run_blocking_under`] picks between the two from a [`FocusPolicy`],
+//!   for tools whose action is one blocking closure (the key tools).
 
 use std::time::Duration;
 
@@ -202,10 +204,10 @@ pub(crate) struct Guarded<T, E> {
 /// then drops the guard. `lease` moves onto that thread for the whole
 /// sequence and comes back in [`Guarded::lease`].
 ///
-/// A nested call (the current task already holds this process's mutation
-/// lease, as a key tool's focus click does) leaves the binding to that
-/// owner instead of releasing it, so the owner's following keys still have
-/// an active app and a key window.
+/// A key tool's focus click runs nested inside the tool's own mutation
+/// lease, before the tool binds the window for its keys; that click binds
+/// and releases its own `Active` context, and the key binding that follows
+/// starts from a released target.
 pub(crate) async fn with_synthetic_focus<T, E>(
     pid: i32,
     window_id: u32,
@@ -218,7 +220,6 @@ where
     T: Send + 'static,
     E: From<Refusal> + Send + 'static,
 {
-    let nested = crate::background_mutation::held_by_current_task(pid);
     with_synthetic_focus_on(
         synthetic_focus::Live,
         pid,
@@ -226,14 +227,12 @@ where
         binding,
         origin,
         lease,
-        nested,
         f,
     )
     .await
 }
 
 /// [`with_synthetic_focus`] over an explicit host, for tests.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn with_synthetic_focus_on<H, T, E>(
     mut host: H,
     pid: i32,
@@ -241,7 +240,6 @@ pub(crate) async fn with_synthetic_focus_on<H, T, E>(
     binding: Binding,
     origin: &'static str,
     lease: Option<BackgroundMutationLease>,
-    leave_to_owner: bool,
     f: impl FnOnce() -> Result<T, E> + Send + 'static,
 ) -> Result<Guarded<T, E>, tokio::task::JoinError>
 where
@@ -253,8 +251,7 @@ where
         // Owned here until the whole sequence is done, whatever happens to
         // the caller's future.
         let lease = lease;
-        let (focus, result) =
-            synthetic_focus::run_with(&mut host, pid, window_id, binding, leave_to_owner, f);
+        let (focus, result) = synthetic_focus::run_with(&mut host, pid, window_id, binding, f);
         tracing::debug!(
             pid,
             window_id,
@@ -272,6 +269,42 @@ where
         }
     })
     .await
+}
+
+/// Run the blocking action `f` on `pid` under `policy`: with the window
+/// bound through [`with_synthetic_focus`] (the lease moves onto the blocking
+/// thread and comes back through `lease`), or on a blocking thread under
+/// [`with_focus_suppressed`]. A refused binding comes back as
+/// `Ok(Err(refusal))`, the action not run; callers turn it into the tool's
+/// structured refusal.
+pub(crate) async fn run_blocking_under<T>(
+    pid: i32,
+    prior_front: Option<i32>,
+    policy: FocusPolicy,
+    origin: &'static str,
+    lease: &mut Option<BackgroundMutationLease>,
+    f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<anyhow::Result<T>, tokio::task::JoinError>
+where
+    T: Send + 'static,
+{
+    match policy {
+        FocusPolicy::Synthetic { window_id, binding } => {
+            let guarded =
+                with_synthetic_focus(pid, window_id, binding, origin, lease.take(), f).await?;
+            *lease = guarded.lease;
+            Ok(guarded.result)
+        }
+        FocusPolicy::Suppress | FocusPolicy::Foreground => {
+            with_focus_suppressed(
+                policy.suppressed_target(pid),
+                prior_front,
+                origin,
+                || async { tokio::task::spawn_blocking(f).await },
+            )
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
@@ -296,7 +329,6 @@ mod tests {
             Binding::Key,
             "test",
             Some(lease),
-            false,
             move || {
                 // The action outlives the caller's patience.
                 std::thread::sleep(Duration::from_millis(150));
@@ -358,7 +390,6 @@ mod tests {
             Binding::KeyMain,
             "test",
             Some(lease),
-            false,
             move || {
                 *flag.lock().unwrap() = true;
                 Ok::<_, Refusal>(())

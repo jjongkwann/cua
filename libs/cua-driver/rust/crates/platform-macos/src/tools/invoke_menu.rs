@@ -1102,6 +1102,7 @@ mod tests {
                 frontmost: Some(true),
                 focused: Some(8),
                 main: Some(7),
+                element: Some(8),
             },
         };
         assert!(matches!(

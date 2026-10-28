@@ -19,7 +19,7 @@ use crate::ax::bindings::{
     copy_bool_attr, copy_string_attr, focused_element_of_pid, AXUIElementRef,
 };
 use crate::focus_guard;
-use crate::window_change_detector::WindowChangeDetector;
+use crate::synthetic_focus::Refusal;
 
 use super::ToolState;
 
@@ -342,7 +342,7 @@ impl Tool for PressKeyTool {
         // destination, proven element ancestry) BEFORE anything is sent —
         // including the px focus click. delivery_mode:"foreground" stays the
         // caller's explicit last resort and is not gated here.
-        let _mutation_lease = if !fg {
+        let mut _mutation_lease = if !fg {
             if let Some(wid) = window_id {
                 match super::gate_background_window_action(
                     pid,
@@ -362,13 +362,6 @@ impl Tool for PressKeyTool {
             }
         } else {
             None
-        };
-
-        // The addressed window must be the app's confirmed key window before
-        // any key (or focus click) goes out; otherwise refuse (window_not_key).
-        let _key_scope = match super::acquire_key_scope(pid, window_id, fg).await {
-            Ok(scope) => scope,
-            Err(refusal) => return refusal,
         };
 
         // px form: pixel-click to focus, then the key goes to the focused element.
@@ -434,67 +427,76 @@ impl Tool for PressKeyTool {
         // The AX focus_element() pre-write also runs inside the closure
         // so any reflex activations it triggers are caught by both the
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
+        //
+        // A background key to an exact window posts with that window bound
+        // as the app's key-routing window (synthetic_focus, Binding::Keys),
+        // confirmed, or refuses (window_not_key); the binding, the key and
+        // the release share one blocking thread with the mutation lease.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let policy = super::keyboard_focus_policy(window_id, fg);
+        let snapshot = policy.snapshot(prior_front, pid);
 
-        let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+        let result = focus_guard::run_blocking_under(
+            pid,
             prior_front,
+            policy,
             "press_key.CGEvent",
-            || async move {
-                tokio::task::spawn_blocking(move || {
-                    let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
-                    let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                    // Foreground rung: keep the exact target frontmost through a genuine
-                    // physical HID key down/up pair, then restore. PID-routed events without the
-                    // authentication envelope reach NSMenu, but Chromium/Electron may
-                    // silently discard them even while frontmost; the guarded HID route
-                    // is accepted by both. Skipped when px-focus already handled the
-                    // target-specific foreground transition.
-                    if fg && !px_focus {
-                        let wid = window_id.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "delivery_mode=foreground requires window_id for press_key"
-                            )
-                        })?;
-                        return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || {
-                                    // Activation may replace the first responder; confirm inside the HID guard.
-                                    with_confirmed_key_focus(
-                                        pre_focus_ptr,
-                                        crate::input::ax_actions::focus_element,
-                                        |target| {
-                                            crate::input::ax_actions::element_has_keyboard_focus(
-                                                pid, target,
-                                            )
-                                        },
-                                        || crate::input::keyboard::press_key_bare_global(&key, &m),
-                                    )
-                                },
-                            )
-                        });
-                    }
-                    // background (default): auth-envelope post, no raise.
-                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        with_confirmed_key_focus(
-                            pre_focus_ptr,
-                            crate::input::ax_actions::focus_element,
-                            |target| {
-                                crate::input::ax_actions::element_has_keyboard_focus(pid, target)
+            &mut _mutation_lease,
+            move || {
+                let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
+                let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                // Foreground rung: keep the exact target frontmost through a genuine
+                // physical HID key down/up pair, then restore. PID-routed events without the
+                // authentication envelope reach NSMenu, but Chromium/Electron may
+                // silently discard them even while frontmost; the guarded HID route
+                // is accepted by both. Skipped when px-focus already handled the
+                // target-specific foreground transition.
+                if fg && !px_focus {
+                    let wid = window_id.ok_or_else(|| {
+                        anyhow::anyhow!("delivery_mode=foreground requires window_id for press_key")
+                    })?;
+                    return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
+                        crate::input::skylight::with_foreground_hid_activation(
+                            pid as libc::pid_t,
+                            wid,
+                            || {
+                                // Activation may replace the first responder; confirm inside the HID guard.
+                                with_confirmed_key_focus(
+                                    pre_focus_ptr,
+                                    crate::input::ax_actions::focus_element,
+                                    |target| {
+                                        crate::input::ax_actions::element_has_keyboard_focus(
+                                            pid, target,
+                                        )
+                                    },
+                                    || crate::input::keyboard::press_key_bare_global(&key, &m),
+                                )
                             },
-                            || crate::input::keyboard::press_key(pid, &key, &m),
                         )
-                    })
+                    });
+                }
+                // background (default): auth-envelope post, no raise.
+                dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
+                    with_confirmed_key_focus(
+                        pre_focus_ptr,
+                        crate::input::ax_actions::focus_element,
+                        |target| crate::input::ax_actions::element_has_keyboard_focus(pid, target),
+                        || crate::input::keyboard::press_key(pid, &key, &m),
+                    )
                 })
-                .await
             },
         )
         .await;
 
         let changes = super::finish_window_observation(snapshot).await;
+
+        // The window could not be bound as the app's key window: no key was
+        // sent, the structured refusal names the exact target.
+        if let (Ok(Err(error)), Some(wid)) = (&result, window_id) {
+            if let Some(refusal) = error.downcast_ref::<Refusal>() {
+                return super::synthetic_focus_refusal(pid, wid, refusal);
+            }
+        }
 
         let delivery_outcome = match result {
             Ok(result) => map_delivery_outcome(result),

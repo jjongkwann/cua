@@ -35,8 +35,8 @@ use crate::apps;
 use crate::ax::bindings::{
     copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
 };
-use crate::focus_guard;
-use crate::window_change_detector::WindowChangeDetector;
+use crate::focus_guard::{self, FocusPolicy};
+use crate::synthetic_focus::Refusal;
 use core_foundation::base::CFRelease;
 use cua_driver_core::background_input::BackgroundRefusal;
 
@@ -218,7 +218,7 @@ impl Tool for TypeTextTool {
         // AX write only (exact element, no CGEvent fallback), or a structured
         // refusal. delivery_mode:"foreground" stays the caller's explicit
         // last resort and is not gated here.
-        let (_mutation_lease, keyboard_policy) = match window_id {
+        let (mut _mutation_lease, keyboard_policy) = match window_id {
             Some(wid) if !delivery_mode.is_foreground() => {
                 let gate_element_ptr = element_guard.as_ref().map(|(g, _)| g.as_ptr());
                 match background_keyboard_policy(pid, wid, gate_element_ptr).await {
@@ -348,8 +348,21 @@ impl Tool for TypeTextTool {
         // Chrome/Safari's "Save Password?" prompt, both of which open
         // helper windows. Wrap so callers see them in the result suffix
         // and the wildcard suppressor catches reflex activations.
+        //
+        // A window-addressed background insert posts with that window bound
+        // as the app's key-routing window (synthetic_focus, Binding::Keys),
+        // proven before the focused element is read or any key is posted, or
+        // refuses (window_not_key; CUA-1767: with Find & Replace open the keys
+        // went into its Find field). A semantic-only request writes through
+        // accessibility and needs no binding.
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let policy = if matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed) {
+            super::keyboard_focus_policy(window_id, delivery_mode.is_foreground())
+        } else {
+            FocusPolicy::Suppress
+        };
+        let key_window_confirmed = matches!(policy, FocusPolicy::Synthetic { .. });
+        let snapshot = policy.snapshot(prior_front, pid);
 
         // Terminal-emulator short-circuit: when the target pid belongs
         // to a known terminal (Ghostty / Terminal.app / iTerm2 / …), the
@@ -360,34 +373,41 @@ impl Tool for TypeTextTool {
 
         let blocking_policy = keyboard_policy.clone();
         let native_guard = element_guard.clone();
-        let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+        let result = focus_guard::run_blocking_under(
+            pid,
             prior_front,
+            policy,
             "type_text.AXSelectedText",
-            || async move {
-                tokio::task::spawn_blocking(move || {
-                    let _native_guard = native_guard;
-                    type_text_blocking(
-                        pid,
-                        &text_clone,
-                        element_ptr,
-                        delay_ms,
-                        is_terminal_target,
-                        KeyboardRoute {
-                            delivery_mode,
-                            window_id,
-                            keyboard_policy: blocking_policy,
-                            explicit_target: element_ptr.is_some() || used_pixel_focus,
-                            key_window_confirmed: false,
-                        },
-                    )
-                })
-                .await
+            &mut _mutation_lease,
+            move || {
+                let _native_guard = native_guard;
+                type_text_in_key_window(
+                    pid,
+                    &text_clone,
+                    element_ptr,
+                    delay_ms,
+                    is_terminal_target,
+                    KeyboardRoute {
+                        delivery_mode,
+                        window_id,
+                        keyboard_policy: blocking_policy,
+                        explicit_target: element_ptr.is_some() || used_pixel_focus,
+                        key_window_confirmed,
+                    },
+                )
             },
         )
         .await;
 
         let changes = super::finish_window_observation(snapshot).await;
+
+        // The window could not be bound as the app's key window: nothing was
+        // sent, the structured refusal names the exact target.
+        if let (Ok(Err(error)), Some(wid)) = (&result, window_id) {
+            if let Some(refusal) = error.downcast_ref::<Refusal>() {
+                return super::synthetic_focus_refusal(pid, wid, refusal);
+            }
+        }
 
         // Unwrap the delivery envelope: a structured refusal means no
         // actuator ran and the caller gets the exact reason.
@@ -860,8 +880,9 @@ async fn background_keyboard_policy(
         }
     };
     let target = ExactWindowTarget { pid, window_id };
-    // The exact window is made key for the key post (see
-    // `super::post_keys_to_window`), so a sibling window is not ambiguous.
+    // The exact window is bound as the app's key-routing window for the key
+    // post (see `super::keyboard_focus_policy`), so a sibling window is not
+    // ambiguous.
     let action = super::window_keyboard_action(BackgroundAction::InsertText);
     match decide_background_input(target, &facts, action) {
         BackgroundInputDecision::Execute { .. } => Ok((lease, BackgroundKeyboardPolicy::Allowed)),
@@ -1308,9 +1329,10 @@ struct KeyboardRoute {
     /// The caller chose where the text goes: an `element_token`, or `x,y`
     /// that pixel-focused a field first.
     explicit_target: bool,
-    /// The addressed window was confirmed as the app's key window before this
-    /// call. An app that is not active reports no focused element even then
-    /// (LibreOffice), so a missing focus is not a reason to refuse.
+    /// The addressed window is the app's key-routing window for this call:
+    /// bound through `synthetic_focus` and confirmed, or already so. An app
+    /// that is not active reports no focused element even then (LibreOffice),
+    /// so a missing focus is not a reason to refuse.
     key_window_confirmed: bool,
 }
 
@@ -1324,48 +1346,8 @@ struct KeyboardRoute {
 /// Returns `(detail, path, verified)`. `verified` is `true` only when a
 /// read-back positively confirmed the text; `false` means the agent must
 /// confirm via screenshot (and, for background, can escalate to foreground).
-fn type_text_blocking(
-    pid: i32,
-    text: &str,
-    element_ptr_and_idx: Option<(usize, Option<usize>)>,
-    delay_ms: u64,
-    is_terminal_target: bool,
-    route: KeyboardRoute,
-) -> anyhow::Result<TypeTextDelivery> {
-    // A window-addressed background insert first makes that window the app's
-    // key window, proven by re-reading the app's focused window, BEFORE the
-    // focused element is read or any key is posted. Unconfirmed: refuse
-    // (CUA-1767: with Find & Replace open the keys went into its Find field).
-    let _scope = if !route.delivery_mode.is_foreground()
-        && matches!(route.keyboard_policy, BackgroundKeyboardPolicy::Allowed)
-    {
-        match super::key_scope(pid, route.window_id) {
-            Ok(scope) => scope,
-            Err(reason) => {
-                return Ok(TypeTextDelivery::Refused(BackgroundRefusal {
-                    code: super::WINDOW_NOT_KEY,
-                    reason,
-                    advice: Some("foreground"),
-                }))
-            }
-        }
-    } else {
-        None
-    };
-    let route = KeyboardRoute {
-        key_window_confirmed: _scope.is_some(),
-        ..route
-    };
-    type_text_in_key_window(
-        pid,
-        text,
-        element_ptr_and_idx,
-        delay_ms,
-        is_terminal_target,
-        route,
-    )
-}
-
+/// Runs with the addressed window bound as the app's key-routing window
+/// ([`crate::focus_guard::run_blocking_under`]).
 fn type_text_in_key_window(
     pid: i32,
     text: &str,
@@ -1908,7 +1890,7 @@ mod tests {
             reason: "test".into(),
             advice: None,
         };
-        let r = type_text_blocking(
+        let r = type_text_in_key_window(
             -1,
             "x",
             None,
@@ -1976,7 +1958,7 @@ mod tests {
     #[test]
     fn oversized_synthesis_is_refused_before_the_terminal_event_path() {
         let text = "x".repeat(6_500);
-        let result = type_text_blocking(
+        let result = type_text_in_key_window(
             -1,
             &text,
             None,

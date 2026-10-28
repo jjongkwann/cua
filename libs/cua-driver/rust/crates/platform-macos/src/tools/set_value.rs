@@ -968,8 +968,12 @@ fn select_chromium_popup_by_typeahead(
         return None;
     }
     // Keys go to the window's focused element, so the window must be the
-    // app's key window (in-app records only; the app is not activated).
-    let _scope = super::key_scope(pid, Some(window_id)).ok()?;
+    // app's key-routing window: bound in the background through
+    // synthetic_focus (nothing is sent when it already routes keys) and
+    // released when this returns. Unconfirmed: open the menu instead.
+    let _focus =
+        crate::synthetic_focus::enter(pid, window_id, crate::synthetic_focus::Binding::Keys)
+            .ok()?;
     crate::input::keyboard::type_text(pid, wanted).ok()?;
     let deadline = std::time::Instant::now() + TYPEAHEAD_SETTLE;
     loop {

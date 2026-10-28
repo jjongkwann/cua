@@ -14,9 +14,16 @@
 //!   are sampled every few milliseconds during the action, so a transient
 //!   theft fails the case even when it was restored before the call returned.
 //!
-//! Nothing here moves the pointer, raises a window or activates an app. Pixel
-//! clicks and drags are not covered: their window frame proof takes a window
-//! capture, which needs Screen Recording.
+//! The keyboard cases type into the fixture's text input through type_text,
+//! type_text_chars, press_key and a hotkey that sends keys, and press a key
+//! addressed to the sibling window, and require every key-down the fixture
+//! saw to have reached the requested window, the field's value to read back,
+//! and the fixture to end inactive.
+//!
+//! Nothing here moves the pointer, raises a window or activates an app. Raw
+//! pixel clicks and drags, and so the pixel focus click of the key tools, are
+//! not covered: their window frame proof takes a window capture, which needs
+//! Screen Recording.
 //!
 //! Run in a TCC-authorized Aqua session after building the fixture with
 //! `tests/fixtures/build/macos.sh --only appkit`:
@@ -355,9 +362,47 @@ mod native {
             .collect()
     }
 
+    /// Which fixture window a case addresses with keys.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Target {
+        Main,
+        Secondary,
+    }
+
+    impl Target {
+        fn window(self, fixture: &Fixture) -> u32 {
+            match self {
+                Target::Main => fixture.main,
+                Target::Secondary => fixture.secondary,
+            }
+        }
+    }
+
+    /// Whether the fixture may see key-downs during the case. Every key-down
+    /// it does see must have reached the addressed window.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Keys {
+        /// A key-down of any kind fails the case.
+        Forbidden,
+        /// Keys may or may not be sent (type_text's AX rung needs none).
+        Allowed(Target),
+        /// At least one key-down must reach the addressed window.
+        Required(Target),
+    }
+
+    impl Keys {
+        fn target(self) -> Option<Target> {
+            match self {
+                Keys::Forbidden => None,
+                Keys::Allowed(target) | Keys::Required(target) => Some(target),
+            }
+        }
+    }
+
     struct Case {
         name: &'static str,
         mode: &'static str,
+        keys: Keys,
         run: fn(&Ctx, &Fixture) -> Value,
         /// Case-specific expectations on the call result and the journal.
         expect: fn(&Fixture, &Value, &TargetView) -> Vec<String>,
@@ -414,8 +459,18 @@ mod native {
 
     /// The value of the fixture's `lbl-counter` label, read through AX.
     fn counter_value(fixture: &Fixture) -> Option<String> {
-        unsafe fn find(element: ax::AXUIElementRef, depth: u32) -> Option<String> {
-            if ax::copy_string_attr(element, "AXIdentifier").as_deref() == Some("lbl-counter") {
+        value_of(fixture, "lbl-counter")
+    }
+
+    /// The `AXValue` of the element with `identifier` in the fixture's main
+    /// window, read through AX.
+    fn value_of(fixture: &Fixture, identifier: &str) -> Option<String> {
+        unsafe fn find(
+            element: ax::AXUIElementRef,
+            identifier: &str,
+            depth: u32,
+        ) -> Option<String> {
+            if ax::copy_string_attr(element, "AXIdentifier").as_deref() == Some(identifier) {
                 return ax::copy_string_attr(element, "AXValue");
             }
             if depth == 0 {
@@ -424,7 +479,7 @@ mod native {
             let mut found = None;
             for child in ax::copy_children(element) {
                 if found.is_none() {
-                    found = find(child, depth - 1);
+                    found = find(child, identifier, depth - 1);
                 }
                 core_foundation::base::CFRelease(child as _);
             }
@@ -435,7 +490,7 @@ mod native {
             let mut found = None;
             for window in ax::copy_ax_windows(app) {
                 if found.is_none() && ax::ax_get_window_id(window) == Some(fixture.main) {
-                    found = find(window, 12);
+                    found = find(window, identifier, 12);
                 }
                 core_foundation::base::CFRelease(window as _);
             }
@@ -444,11 +499,65 @@ mod native {
         }
     }
 
+    /// The fixture's text input (`txt-input`, placeholder "Type here…") in
+    /// the main window's snapshot: its element token.
+    fn text_input(ctx: &Ctx, fixture: &Fixture) -> Result<String, String> {
+        let state = snapshot(ctx, fixture);
+        let elements = state
+            .pointer("/structuredContent/elements")
+            .or_else(|| state.pointer("/structured_content/elements"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let field = elements
+            .iter()
+            .find(|e| e["role"] == "AXTextField" && e["label"] == "Type here\u{2026}")
+            .or_else(|| elements.iter().find(|e| e["role"] == "AXTextField"))
+            .ok_or_else(|| {
+                format!(
+                    "no AXTextField in get_window_state: {}",
+                    result_text(&state)
+                )
+            })?;
+        field["element_token"]
+            .as_str()
+            .ok_or_else(|| format!("the text field has no element_token: {field}"))
+            .map(str::to_owned)
+    }
+
+    fn setup_failure(message: String) -> Value {
+        json!({ "isError": true, "content": [{ "type": "text", "text": message }] })
+    }
+
+    /// The result and the text input's value after a keyboard case.
+    fn with_input_value(mut result: Value, fixture: &Fixture) -> Value {
+        std::thread::sleep(Duration::from_millis(300));
+        result["input_after"] = json!(value_of(fixture, "txt-input"));
+        result
+    }
+
+    /// A keyboard case passes when the call succeeded and the text input
+    /// holds exactly `expected`.
+    fn expect_typed(expected: &str, result: &Value) -> Vec<String> {
+        let mut failures = Vec::new();
+        if is_error(result) {
+            failures.push(format!("call refused: {}", result_text(result)));
+        }
+        if result["input_after"] != expected {
+            failures.push(format!(
+                "expected the text input to read {expected:?}, it reads {}",
+                result["input_after"]
+            ));
+        }
+        failures
+    }
+
     fn cases() -> Vec<Case> {
         vec![
             Case {
                 name: "invoke_menu_key_main_context",
                 mode: "two-windows",
+                keys: Keys::Forbidden,
                 run: |ctx, fixture| arrange_left(ctx, fixture, fixture.main),
                 expect: |fixture, result, view| {
                     let mut failures = Vec::new();
@@ -471,6 +580,7 @@ mod native {
             Case {
                 name: "invoke_menu_sibling_window_context",
                 mode: "two-windows",
+                keys: Keys::Forbidden,
                 run: |ctx, fixture| arrange_left(ctx, fixture, fixture.secondary),
                 expect: |_, result, view| {
                     let mut failures = Vec::new();
@@ -490,6 +600,7 @@ mod native {
             Case {
                 name: "invoke_menu_truly_unavailable_item",
                 mode: "two-windows",
+                keys: Keys::Forbidden,
                 run: |ctx, fixture| {
                     let title = app_menu_title(fixture.pid);
                     call(
@@ -517,6 +628,7 @@ mod native {
             Case {
                 name: "invoke_menu_sheet_blocks_requested_window",
                 mode: "sheet",
+                keys: Keys::Forbidden,
                 run: |ctx, fixture| arrange_left(ctx, fixture, fixture.main),
                 expect: |_, result, view| {
                     let mut failures = Vec::new();
@@ -535,6 +647,7 @@ mod native {
             Case {
                 name: "click_ax_press_native_button",
                 mode: "two-windows",
+                keys: Keys::Forbidden,
                 run: |ctx, fixture| {
                     let state = snapshot(ctx, fixture);
                     let token = state
@@ -570,6 +683,122 @@ mod native {
                         failures.push(format!(
                             "expected the press to run exactly once, counter is {}",
                             result["counter_after"]
+                        ));
+                    }
+                    failures
+                },
+            },
+            Case {
+                name: "type_text_ax_element_in_background_window",
+                mode: "two-windows",
+                keys: Keys::Allowed(Target::Main),
+                run: |ctx, fixture| {
+                    let token = match text_input(ctx, fixture) {
+                        Ok(found) => found,
+                        Err(message) => return setup_failure(message),
+                    };
+                    let result = call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "type_text",
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "text": "cua" }),
+                    );
+                    with_input_value(result, fixture)
+                },
+                expect: |_, result, _| expect_typed("cua", result),
+            },
+            Case {
+                name: "type_text_chars_in_background_window",
+                mode: "two-windows",
+                keys: Keys::Required(Target::Main),
+                run: |ctx, fixture| {
+                    let token = match text_input(ctx, fixture) {
+                        Ok(found) => found,
+                        Err(message) => return setup_failure(message),
+                    };
+                    let result = call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "type_text_chars",
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "text": "xy", "delay_ms": 10 }),
+                    );
+                    with_input_value(result, fixture)
+                },
+                expect: |_, result, _| expect_typed("xy", result),
+            },
+            Case {
+                name: "press_key_in_background_window",
+                mode: "two-windows",
+                keys: Keys::Required(Target::Main),
+                run: |ctx, fixture| {
+                    let token = match text_input(ctx, fixture) {
+                        Ok(found) => found,
+                        Err(message) => return setup_failure(message),
+                    };
+                    let result = call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "press_key",
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "key": "k" }),
+                    );
+                    with_input_value(result, fixture)
+                },
+                expect: |_, result, _| expect_typed("k", result),
+            },
+            Case {
+                name: "hotkey_keys_in_background_window",
+                mode: "two-windows",
+                keys: Keys::Required(Target::Main),
+                run: |ctx, fixture| {
+                    let token = match text_input(ctx, fixture) {
+                        Ok(found) => found,
+                        Err(message) => return setup_failure(message),
+                    };
+                    // shift+m is no menu key equivalent of the fixture, so
+                    // the combo goes out as key events.
+                    let result = call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "hotkey",
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "keys": ["shift", "m"] }),
+                    );
+                    with_input_value(result, fixture)
+                },
+                expect: |_, result, _| expect_typed("M", result),
+            },
+            Case {
+                // The sibling window holds only a label: the key has nowhere
+                // to go, but it must reach that window and no other, and the
+                // binding it took must be handed back with the main window
+                // the app's focused window again.
+                name: "press_key_sibling_window_routes_and_releases",
+                mode: "two-windows",
+                keys: Keys::Required(Target::Secondary),
+                run: |ctx, fixture| {
+                    let result = call(
+                        &ctx.runtime,
+                        &ctx.registry,
+                        "press_key",
+                        json!({ "pid": fixture.pid, "window_id": fixture.secondary, "key": "k" }),
+                    );
+                    with_input_value(result, fixture)
+                },
+                expect: |fixture, result, _| {
+                    let mut failures = Vec::new();
+                    if is_error(result) {
+                        failures.push(format!("call refused: {}", result_text(result)));
+                    }
+                    if result["input_after"] != "" {
+                        failures.push(format!(
+                            "the main window's text input took the key: {}",
+                            result["input_after"]
+                        ));
+                    }
+                    if ax::focused_window_id_of_pid(fixture.pid) != Some(fixture.main) {
+                        failures.push(format!(
+                            "the app's focused window is {:?} after the call, not the main window {}",
+                            ax::focused_window_id_of_pid(fixture.pid),
+                            fixture.main
                         ));
                     }
                     failures
@@ -640,13 +869,38 @@ mod native {
             if after != launched {
                 failures.push("the user's focus differs after the call".into());
             }
-            let leaked_keys: Vec<&Value> = view
+            let key_downs: Vec<&Value> = view
                 .events
                 .iter()
                 .filter(|e| e["kind"] == "key_down")
                 .collect();
-            if !leaked_keys.is_empty() {
-                failures.push(format!("the fixture received key-downs: {leaked_keys:?}"));
+            let responders: std::collections::BTreeSet<String> = key_downs
+                .iter()
+                .map(|e| e["responder"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            match case.keys {
+                Keys::Forbidden if !key_downs.is_empty() => {
+                    failures.push(format!("the fixture received key-downs: {key_downs:?}"));
+                }
+                Keys::Required(_) if key_downs.is_empty() => {
+                    failures.push("no key-down reached the fixture".into());
+                }
+                _ => {}
+            }
+            let addressed = case.keys.target().map(|target| target.window(&fixture));
+            let elsewhere: Vec<&&Value> = key_downs
+                .iter()
+                .filter(|e| e["window"].as_u64().map(|w| w as u32) != addressed)
+                .collect();
+            if !elsewhere.is_empty() {
+                failures.push(format!(
+                    "key-downs reached a window other than {addressed:?}: {elsewhere:?}"
+                ));
+            }
+            if responders.len() > 1 {
+                failures.push(format!(
+                    "key-downs reached more than one responder: {responders:?}"
+                ));
             }
             passed &= failures.is_empty();
             reports.push(json!({
@@ -659,6 +913,13 @@ mod native {
                     "code": refusal_code(&result),
                     "text": result_text(&result).chars().take(400).collect::<String>(),
                     "counter_after": result.get("counter_after"),
+                    "input_after": result.get("input_after"),
+                },
+                "keys": {
+                    "key_downs": key_downs.len(),
+                    "windows": key_downs.iter().map(|e| e["window"].clone()).collect::<Vec<_>>(),
+                    "responders": responders,
+                    "characters": key_downs.iter().map(|e| e["characters"].clone()).collect::<Vec<_>>(),
                 },
                 "target": {
                     "pid": fixture.pid,

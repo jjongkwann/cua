@@ -49,6 +49,8 @@ use cua_driver_core::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::focus_guard::FocusPolicy;
+use crate::synthetic_focus::Binding;
 use crate::{ax::snapshot::Snapshots, cursor::state::CursorRegistry};
 
 fn native_window_id(
@@ -451,9 +453,9 @@ async fn decide_background_window_action(
 }
 
 /// The keyboard action class for a window-addressed background key or text
-/// request. When the focus-record transport exists the exact window is made
-/// the app's key window for the duration of the post (see
-/// [`post_keys_to_window`]), so a second same-pid window is not ambiguous.
+/// request. When the focus-record transport exists the exact window is bound
+/// as the app's key-routing window for the duration of the post (see
+/// [`keyboard_focus_policy`]), so a second same-pid window is not ambiguous.
 /// Without it the caller's fail-closed `generic` class applies.
 pub(crate) fn window_keyboard_action(
     generic: cua_driver_core::background_input::BackgroundAction,
@@ -465,50 +467,23 @@ pub(crate) fn window_keyboard_action(
     }
 }
 
-/// Make `window_id` the app's key window, confirmed, for pid-routed keys.
-/// `Ok(None)` when no window is addressed or the SPIs are missing (keys go
-/// where they always did). `Err` carries the refusal text: no key may be
-/// posted, it could reach a sibling window.
-pub(crate) fn key_scope(
-    pid: i32,
-    window_id: Option<u32>,
-) -> Result<Option<crate::input::skylight::WindowKeyScope>, String> {
+/// The focus posture of a window-addressed key post. In the background the
+/// exact window is bound as the app's key-routing window for the post
+/// ([`crate::synthetic_focus`], [`Binding::Keys`]: nothing is sent when the
+/// window already routes keys), and released afterwards. A foreground or
+/// pid-only request keeps plain suppression: the foreground rung fronts the
+/// window itself, and a pid-only post goes where the app routes it.
+pub(crate) fn keyboard_focus_policy(window_id: Option<u32>, foreground: bool) -> FocusPolicy {
     match window_id {
-        Some(wid) if crate::input::skylight::is_focus_without_raise_available() => {
-            crate::input::skylight::enter_exact_window_key(pid as libc::pid_t, wid).map(Some)
+        Some(window_id)
+            if !foreground && crate::input::skylight::is_focus_without_raise_available() =>
+        {
+            FocusPolicy::Synthetic {
+                window_id,
+                binding: Binding::Keys,
+            }
         }
-        _ => Ok(None),
-    }
-}
-
-/// [`key_scope`] for an async tool: runs the blocking prime off the runtime and
-/// turns an unconfirmed key window into the structured `window_not_key`
-/// refusal. Foreground requests and pid-only calls hold no scope.
-pub(crate) async fn acquire_key_scope(
-    pid: i32,
-    window_id: Option<u32>,
-    foreground: bool,
-) -> Result<Option<crate::input::skylight::WindowKeyScope>, cua_driver_core::protocol::ToolResult> {
-    let Some(wid) = window_id.filter(|_| !foreground) else {
-        return Ok(None);
-    };
-    match tokio::task::spawn_blocking(move || key_scope(pid, Some(wid))).await {
-        Ok(Ok(scope)) => Ok(scope),
-        Ok(Err(_)) if crate::input::skylight::windowserver_connection_invalid() => {
-            Err(windowserver_connection_refusal(pid, Some(wid)))
-        }
-        Ok(Err(reason)) => Err(background_refusal_result(
-            pid,
-            wid,
-            &cua_driver_core::background_input::BackgroundRefusal {
-                code: WINDOW_NOT_KEY,
-                reason,
-                advice: Some("foreground"),
-            },
-        )),
-        Err(error) => Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "Could not prepare the key window for pid {pid}: {error}"
-        ))),
+        _ => FocusPolicy::Suppress,
     }
 }
 
