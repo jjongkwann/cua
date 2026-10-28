@@ -503,17 +503,17 @@ fn click_at_xy_inner(
     })
 }
 
-/// Prepare a raw background pixel click by making the target window AppKit-key
-/// without raising or restacking it and without taking key status from the
-/// user's window.
+/// Tell the target it is active (the activation notice only) before raw
+/// background input, without raising or restacking its window and without
+/// taking key status from the user's window.
 ///
-/// The Swift implementation ran this immediately before the stamped event
-/// stream. The original Rust port retained the SkyLight primitive but omitted
-/// this call while cursor-overlay repinning was incomplete. Callers should
-/// re-pin their overlay after this returns, then post the click sequence.
+/// The background `click` and `drag` tools no longer call this: they bind
+/// the target through [`crate::synthetic_focus`], which also hands the
+/// activation back afterwards. The browser setup path still uses it; it is
+/// the next caller to move.
 ///
-/// Returns whether the private focus-without-raise recipe succeeded. Event
-/// posting remains best-effort when the private APIs are unavailable.
+/// Returns whether the notice was posted. Event posting remains best-effort
+/// when the private APIs are unavailable.
 pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
     // Post only the focus record to the target. The defocus record to the
     // current front process made the user's key window resign key, and
@@ -530,9 +530,10 @@ pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
 /// Event kinds in the pure route plan for the Chromium-compatible background
 /// left-click recipe.
 ///
-/// The sequence stays PID/window-routed throughout. The caller must first run
-/// [`prepare_background_pixel_click`] for background delivery, then re-pin any
-/// cursor overlay before entering this event stream.
+/// The sequence stays PID/window-routed throughout. The caller first makes
+/// the target believe it is active for background delivery
+/// ([`crate::synthetic_focus`]), then re-pins any cursor overlay before
+/// entering this event stream.
 ///  1. Stamped `mouseMoved` at target coords (f0=2, cursor-state primer).
 ///  2. Off-screen primer down/up at (-1, -1) (f0=1/2) — satisfies Chromium's
 ///     user-activation gate without hitting any DOM element.
@@ -895,8 +896,8 @@ fn background_drag_plan(
 /// (f58), and is stamped with its own location. The hardware pointer is never
 /// warped and nothing is posted to the global HID tap, so the user's pointer,
 /// frontmost app and window order stay as they were. The caller makes the
-/// window AppKit-key without raising it first
-/// ([`prepare_background_pixel_click`]).
+/// target believe it is active first, without raising it
+/// ([`crate::synthetic_focus`]).
 ///
 /// `keep_going` runs after each drag step; when it returns false the rest of
 /// the path is skipped and the release is posted at once where the gesture
