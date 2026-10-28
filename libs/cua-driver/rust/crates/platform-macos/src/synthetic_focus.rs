@@ -76,6 +76,8 @@ const READBACK_POLL: Duration = Duration::from_millis(20);
 const KEY_READBACK: Duration = Duration::from_millis(400);
 /// Longest wait for the app to report itself active.
 const ACTIVE_READBACK: Duration = Duration::from_millis(200);
+/// Longest wait for an `AXFocusedWindow` write to show.
+const AX_FOCUS_READBACK: Duration = Duration::from_millis(200);
 
 /// How far the target is bound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,9 +91,11 @@ pub enum Binding {
     /// AppKit resolves window and document menus against.
     KeyMain,
     /// Keys posted to the process reach `window`. Nothing is sent when the
-    /// app's focused window is `window` and it has a focused element (AppKit
+    /// app's focused window is `window` and holds its focused element (AppKit
     /// routes posted keys by window; VCL to its focused window); otherwise
-    /// `window` is bound as for [`Binding::Key`].
+    /// `window` is bound as for [`Binding::Key`], with the records sent a
+    /// second time and, for an app with no focused element, an
+    /// `AXFocusedWindow` write when they do not take.
     Keys,
 }
 
@@ -131,12 +135,14 @@ impl TargetState {
     }
 
     /// Keys posted to the process already reach `window`: it is the app's
-    /// focused window and something in the app has focus. The predictor
+    /// focused window and holds the app's focused element. The predictor
     /// measured on LibreOffice (keys went to `AXFocusedWindow` in every
     /// trial) and seen on AppKit (an inactive app with no key window took
-    /// keys into the focused window's first responder).
+    /// keys into the focused window's first responder). A focused element in
+    /// another window (a panel's field, or the modeless dialog field VCL
+    /// keeps reporting) leaves the route unproven, so the window is bound.
     fn routes_keys(self, window: u32) -> bool {
-        self.focused == Some(window) && self.element.is_some()
+        self.focused == Some(window) && self.element == Some(window)
     }
 }
 
@@ -237,6 +243,8 @@ pub(crate) trait Host {
     fn post_make_key(&mut self, pid: i32, window: u32) -> bool;
     fn settle(&mut self, duration: Duration);
     fn connection_invalid(&mut self) -> bool;
+    /// Write the app's `AXFocusedWindow`.
+    fn set_focused_window(&mut self, pid: i32, window: u32) -> bool;
 }
 
 /// SkyLight and Accessibility.
@@ -308,6 +316,37 @@ impl Host for Live {
     fn connection_invalid(&mut self) -> bool {
         skylight::windowserver_connection_invalid()
     }
+
+    fn set_focused_window(&mut self, pid: i32, window: u32) -> bool {
+        use crate::ax::bindings::{
+            ax_get_window_id, copy_ax_windows, AXUIElementCreateApplication,
+            AXUIElementSetAttributeValue,
+        };
+        use core_foundation::{
+            base::{CFRelease, TCFType},
+            string::CFString,
+        };
+        unsafe {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                return false;
+            }
+            let attr = CFString::new("AXFocusedWindow");
+            let mut ok = false;
+            for candidate in copy_ax_windows(app) {
+                if !ok && ax_get_window_id(candidate) == Some(window) {
+                    ok = AXUIElementSetAttributeValue(
+                        app,
+                        attr.as_concrete_TypeRef(),
+                        candidate as core_foundation::base::CFTypeRef,
+                    ) == 0;
+                }
+                CFRelease(candidate as _);
+            }
+            CFRelease(app as _);
+            ok
+        }
+    }
 }
 
 /// Why nothing was sent and nothing is undone on exit.
@@ -355,6 +394,32 @@ impl Entered {
             },
         }
     }
+}
+
+/// Read the app's state until it reports `binding` for `window`, for at most
+/// `budget`. A key-routing binding also waits for the window to hold the
+/// focused element: a LibreOffice that has never been active shows it last
+/// and drops keys until then (CUA-1767).
+fn read_back<H: Host>(
+    host: &mut H,
+    pid: i32,
+    window: u32,
+    binding: Binding,
+    budget: Duration,
+) -> TargetState {
+    let settled = |state: TargetState| {
+        state.satisfies(window, binding)
+            && (binding != Binding::Keys || state.element == Some(window))
+    };
+    let max_polls = (budget.as_millis() / READBACK_POLL.as_millis()) as u32;
+    let mut state = host.target_state(pid);
+    let mut polls = 0u32;
+    while !settled(state) && polls < max_polls {
+        host.settle(READBACK_POLL);
+        state = host.target_state(pid);
+        polls += 1;
+    }
+    state
 }
 
 fn enter_with<H: Host>(
@@ -414,15 +479,29 @@ fn enter_with<H: Host>(
         Binding::Active => ACTIVE_READBACK,
         Binding::Key | Binding::KeyMain | Binding::Keys => KEY_READBACK,
     };
-    let max_polls = (budget.as_millis() / READBACK_POLL.as_millis()) as u32;
-    let mut state = host.target_state(pid);
-    let mut polls = 0u32;
-    while !state.satisfies(window, binding) && polls < max_polls {
-        host.settle(READBACK_POLL);
-        state = host.target_state(pid);
-        polls += 1;
-    }
+    let mut state = read_back(host, pid, window, binding, budget);
     bound.confirmed = state.satisfies(window, binding);
+    if binding == Binding::Keys && !bound.confirmed {
+        // The records arrive asynchronously, and the app can still be
+        // handling the first pass (measured on LibreOffice): send them once
+        // more. The pair binds only while the app goes active, so it resigns
+        // the activation just sent first.
+        host.post_deactivation(pid, window);
+        host.settle(RECORD_SETTLE);
+        host.post_activation(pid, window);
+        host.settle(RECORD_SETTLE);
+        host.post_make_key(pid, window);
+        state = read_back(host, pid, window, binding, budget);
+        bound.confirmed = state.satisfies(window, binding);
+        // A LibreOffice that has never been active has no focused element
+        // and can ignore the records; VCL routes keys to its AXFocusedWindow,
+        // so writing it is the last step (CUA-1767), proven the way that
+        // route was measured: the window reads back as the focused one.
+        if !bound.confirmed && state.element.is_none() && host.set_focused_window(pid, window) {
+            state = read_back(host, pid, window, binding, AX_FOCUS_READBACK);
+            bound.confirmed = state.focused == Some(window);
+        }
+    }
     // Raw pixel input never required the app to confirm its activation
     // (an app without Accessibility cannot); a key binding is proof or
     // nothing.
@@ -561,6 +640,9 @@ pub(crate) mod fake {
         Activation(i32, u32),
         Deactivation(i32, u32),
         MakeKey(i32, u32),
+        AxFocusedWindow(i32, u32),
+        /// The window came to hold the app's focused element.
+        ElementReady(u32),
         Dispatch,
     }
 
@@ -605,6 +687,14 @@ pub(crate) mod fake {
         /// Follow the records: an activation plus make-key pair binds that
         /// window, a deactivation clears everything.
         pub follow_records: bool,
+        /// How many make-key pairs the app ignores before one takes.
+        pub ignored_make_keys: u32,
+        /// `None`: a pair that takes gives its window the focused element at
+        /// once (AppKit). `Some(n)`: the element shows after `n` more state
+        /// reads, never for `u32::MAX` (a LibreOffice that has never been
+        /// active).
+        pub element_after_reads: Option<u32>,
+        pending_element: Option<(u32, u32)>,
         live: TargetState,
     }
 
@@ -615,6 +705,9 @@ pub(crate) mod fake {
                 script,
                 ops: Arc::new(Mutex::new(Vec::new())),
                 follow_records: true,
+                ignored_make_keys: 0,
+                element_after_reads: None,
+                pending_element: None,
                 live,
             }
         }
@@ -647,6 +740,15 @@ pub(crate) mod fake {
 
         fn target_state(&mut self, _pid: i32) -> TargetState {
             if self.follow_records {
+                match self.pending_element {
+                    Some((window, 0)) => {
+                        self.pending_element = None;
+                        self.live.element = Some(window);
+                        self.record(Op::ElementReady(window));
+                    }
+                    Some((window, reads)) => self.pending_element = Some((window, reads - 1)),
+                    None => {}
+                }
                 return self.live;
             }
             if self.script.states.len() > 1 {
@@ -668,8 +770,8 @@ pub(crate) mod fake {
         fn post_activation(&mut self, pid: i32, window: u32) -> bool {
             self.record(Op::Activation(pid, window));
             if self.follow_records {
+                // No window becomes key by the activation alone.
                 self.live.frontmost = Some(true);
-                self.live.focused = Some(window);
             }
             self.script.posts_succeed
         }
@@ -685,9 +787,16 @@ pub(crate) mod fake {
         fn post_make_key(&mut self, pid: i32, window: u32) -> bool {
             self.record(Op::MakeKey(pid, window));
             if self.follow_records {
-                self.live.focused = Some(window);
-                self.live.main = Some(window);
-                self.live.element = Some(window);
+                if self.ignored_make_keys > 0 {
+                    self.ignored_make_keys -= 1;
+                } else {
+                    self.live.focused = Some(window);
+                    self.live.main = Some(window);
+                    match self.element_after_reads {
+                        None => self.live.element = Some(window),
+                        Some(reads) => self.pending_element = Some((window, reads)),
+                    }
+                }
             }
             self.script.posts_succeed
         }
@@ -696,6 +805,14 @@ pub(crate) mod fake {
 
         fn connection_invalid(&mut self) -> bool {
             self.script.connection_invalid
+        }
+
+        fn set_focused_window(&mut self, pid: i32, window: u32) -> bool {
+            self.record(Op::AxFocusedWindow(pid, window));
+            if self.follow_records {
+                self.live.focused = Some(window);
+            }
+            true
         }
     }
 }
@@ -1108,6 +1225,173 @@ mod tests {
         assert_eq!(fake.ops(), vec![Op::ProtectKeyFocus(TARGET), Op::Dispatch]);
     }
 
+    /// The ops up to the dispatch, and whether every activation sent was
+    /// handed back.
+    fn up_to_dispatch(ops: &[Op]) -> (Vec<Op>, bool) {
+        let end = ops
+            .iter()
+            .position(|op| *op == Op::Dispatch)
+            .map_or(ops.len(), |at| at + 1);
+        let count = |want: fn(&Op) -> bool| ops.iter().filter(|op| want(op)).count();
+        (
+            ops[..end].to_vec(),
+            count(|op| matches!(op, Op::Activation(..)))
+                == count(|op| matches!(op, Op::Deactivation(..))),
+        )
+    }
+
+    #[test]
+    fn keys_to_a_window_whose_focused_element_is_elsewhere_bind_it() {
+        // The focused window is the requested one, but the focused element is
+        // in another window (a panel's field): keys are not proven to route.
+        let mut script = Script::background(TARGET, MAIN);
+        script.states = [TargetState {
+            frontmost: Some(false),
+            focused: Some(MAIN),
+            main: Some(MAIN),
+            element: Some(SIBLING),
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        let (report, result) = run(&mut fake, MAIN, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.synthetic && report.confirmed);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::Dispatch,
+                Op::Deactivation(TARGET, MAIN),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_wait_for_the_window_to_hold_the_focused_element_before_dispatch() {
+        // A LibreOffice that has never been active: its focused window is
+        // the requested one, it has no focused element, and the element shows
+        // only some reads after the pair. Keys posted before it are dropped.
+        let mut script = Script::background(TARGET, MAIN);
+        script.states = [TargetState {
+            frontmost: Some(false),
+            focused: Some(MAIN),
+            main: Some(MAIN),
+            element: None,
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        fake.element_after_reads = Some(3);
+        let (report, result) = run(&mut fake, MAIN, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.confirmed);
+        assert_eq!(
+            fake.ops(),
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::ElementReady(MAIN),
+                Op::Dispatch,
+                Op::Deactivation(TARGET, MAIN),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_send_the_records_a_second_time_when_the_first_pass_does_not_take() {
+        let mut script = Script::background(TARGET, MAIN);
+        script.order = vec![MAIN, SIBLING];
+        let mut fake = Fake::new(script);
+        fake.ignored_make_keys = 1;
+        let (report, result) = run(&mut fake, SIBLING, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.confirmed);
+        let (until_dispatch, paired) = up_to_dispatch(&fake.ops());
+        assert_eq!(
+            until_dispatch,
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, SIBLING),
+                Op::MakeKey(TARGET, SIBLING),
+                // Second pass: resign the activation just sent, then again.
+                Op::Deactivation(TARGET, SIBLING),
+                Op::Activation(TARGET, SIBLING),
+                Op::MakeKey(TARGET, SIBLING),
+                Op::Dispatch,
+            ]
+        );
+        assert!(paired, "{:?}", fake.ops());
+    }
+
+    #[test]
+    fn keys_to_an_app_with_no_focused_element_write_its_focused_window_last() {
+        // A LibreOffice that has never been active, another document
+        // focused, ignores both passes of the records; VCL routes keys to
+        // AXFocusedWindow, so the write is the last step.
+        let mut script = Script::background(TARGET, MAIN);
+        script.order = vec![SIBLING, MAIN];
+        script.states = [TargetState {
+            frontmost: Some(false),
+            focused: Some(SIBLING),
+            main: Some(SIBLING),
+            element: None,
+        }]
+        .into();
+        let mut fake = Fake::new(script);
+        fake.ignored_make_keys = 2;
+        fake.element_after_reads = Some(u32::MAX);
+        let (report, result) = run(&mut fake, MAIN, Binding::Keys);
+        assert_eq!(result, Ok("dispatched"));
+        assert!(report.confirmed);
+        let (until_dispatch, paired) = up_to_dispatch(&fake.ops());
+        assert_eq!(
+            until_dispatch,
+            vec![
+                Op::ProtectKeyFocus(TARGET),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::Deactivation(TARGET, MAIN),
+                Op::Activation(TARGET, MAIN),
+                Op::MakeKey(TARGET, MAIN),
+                Op::AxFocusedWindow(TARGET, MAIN),
+                Op::Dispatch,
+            ]
+        );
+        assert!(paired, "{:?}", fake.ops());
+    }
+
+    #[test]
+    fn keys_that_never_take_with_a_focused_element_refuse_without_the_ax_write() {
+        // An app with a focused element that ignores the records (a sheet
+        // holds key): the write is not the route for it; refuse.
+        let mut script = Script::background(TARGET, MAIN);
+        script.order = vec![MAIN, SIBLING];
+        let mut fake = Fake::new(script);
+        fake.ignored_make_keys = 2;
+        let (report, result) = run(&mut fake, SIBLING, Binding::Keys);
+        assert!(
+            matches!(
+                result,
+                Err(Refusal::Unconfirmed {
+                    window: SIBLING,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(report, Report::default());
+        let ops = fake.ops();
+        assert!(!ops.contains(&Op::Dispatch), "{ops:?}");
+        assert!(
+            !ops.iter().any(|op| matches!(op, Op::AxFocusedWindow(..))),
+            "{ops:?}"
+        );
+        let (_, paired) = up_to_dispatch(&ops);
+        assert!(paired, "{ops:?}");
+    }
+
     #[test]
     fn an_invalid_windowserver_connection_is_its_own_refusal() {
         let mut script = Script::background(TARGET, MAIN);
@@ -1133,11 +1417,17 @@ mod tests {
         assert!(bound.satisfies(MAIN, Binding::Keys));
         assert!(!bound.satisfies(MAIN, Binding::KeyMain));
         assert!(!bound.satisfies(SIBLING, Binding::Key));
-        // Routing needs a focused element, not an active app.
+        // Routing needs the focused element in the window, not an active app.
         assert!(!bound.routes_keys(MAIN));
         assert!(TargetState {
             frontmost: Some(false),
             element: Some(MAIN),
+            ..bound
+        }
+        .routes_keys(MAIN));
+        assert!(!TargetState {
+            frontmost: Some(false),
+            element: Some(SIBLING),
             ..bound
         }
         .routes_keys(MAIN));

@@ -25,8 +25,8 @@ use crate::ax::bindings::{
     copy_bool_attr, copy_children, copy_number_attr, copy_string_attr, copy_url_attr,
     kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
 };
-use crate::focus_guard;
-use crate::window_change_detector::WindowChangeDetector;
+use crate::focus_guard::{self, FocusPolicy};
+use crate::synthetic_focus::{Binding, Refusal};
 use core_foundation::base::CFRelease;
 
 use super::ToolState;
@@ -115,7 +115,7 @@ impl Tool for SetValueTool {
         // that the retained element still belongs to the requested exact
         // window immediately before any cursor or AX work; a cache hit alone
         // is not delivery proof after a window lifecycle or Space change.
-        let _mutation_lease = match super::gate_background_window_action(
+        let mut _mutation_lease = match super::gate_background_window_action(
             pid,
             window_id,
             Some(element_ptr),
@@ -123,7 +123,7 @@ impl Tool for SetValueTool {
         )
         .await
         {
-            Ok(lease) => lease,
+            Ok(lease) => Some(lease),
             Err(refusal_result) => return refusal_result,
         };
 
@@ -213,24 +213,48 @@ impl Tool for SetValueTool {
         // AXValue writes on popups / sliders can cause reflex activations
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
         // child option which can trigger app activation in some setups.
+        //
+        // A background Chromium `<select>` is set by the page's type-ahead,
+        // which posts keys: the window is bound as the app's key-routing
+        // window for the whole operation (synthetic_focus, Binding::Keys),
+        // with the per-PID lease on the same blocking thread, or the call
+        // refuses (window_not_key) with nothing sent.
+        let typeahead_guard = element_guard.clone();
+        let typeahead_value = value.clone();
+        let typeahead = tokio::task::spawn_blocking(move || {
+            typeahead_applies(
+                typeahead_guard.as_ptr() as AXUIElementRef,
+                pid,
+                &typeahead_value,
+            )
+        })
+        .await
+        .unwrap_or(false);
+        let policy = if typeahead {
+            FocusPolicy::Synthetic {
+                window_id,
+                binding: Binding::Keys,
+            }
+        } else {
+            FocusPolicy::Suppress
+        };
         let prior_front = apps::frontmost_pid();
-        let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let snapshot = policy.snapshot(prior_front, pid);
 
-        let result = focus_guard::with_focus_suppressed(
-            Some(pid),
+        let result = focus_guard::run_blocking_under(
+            pid,
             prior_front,
+            policy,
             "set_value.AXValue",
-            || async move {
-                tokio::task::spawn_blocking(move || {
-                    set_value_blocking(
-                        element_guard.as_ptr(),
-                        element_index,
-                        pid,
-                        window_id,
-                        &value,
-                    )
-                })
-                .await
+            &mut _mutation_lease,
+            move || {
+                set_value_blocking(
+                    element_guard.as_ptr(),
+                    element_index,
+                    pid,
+                    &value,
+                    typeahead,
+                )
             },
         )
         .await;
@@ -238,6 +262,11 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
+            Ok(Err(e)) if e.downcast_ref::<Refusal>().is_some() => super::synthetic_focus_refusal(
+                pid,
+                window_id,
+                e.downcast_ref::<Refusal>().expect("checked"),
+            ),
             Ok(Ok(outcome)) if outcome.not_applied && !ax_echo_surface => {
                 let vcl = crate::input::pointer_toolkit::detect(pid)
                     == Some(crate::input::pointer_toolkit::PointerReadingToolkit::Vcl);
@@ -470,12 +499,15 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
     }
 }
 
+/// `typeahead`: the window is bound for posted keys ([`typeahead_applies`]
+/// held when the operation started), so a Chromium `<select>` may take the
+/// page's type-ahead.
 fn set_value_blocking(
     element_ptr: usize,
     element_index: usize,
     pid: i32,
-    window_id: u32,
     value: &str,
+    typeahead: bool,
 ) -> anyhow::Result<SetValueOutcome> {
     let element = element_ptr as AXUIElementRef;
 
@@ -488,9 +520,9 @@ fn set_value_blocking(
             element,
             element_index,
             pid,
-            window_id,
             value,
             &element_title,
+            typeahead,
         )
         .map(|detail| SetValueOutcome {
             detail,
@@ -926,6 +958,16 @@ pub(super) fn chromium_select_open_refusal(
 /// How long the page may take to apply a type-ahead selection.
 const TYPEAHEAD_SETTLE: std::time::Duration = std::time::Duration::from_millis(800);
 
+/// Whether `value` may be chosen in `popup` by the page's type-ahead: a
+/// closed popup of a Chromium renderer whose app is not in front.
+fn typeahead_applies(popup: AXUIElementRef, pid: i32, value: &str) -> bool {
+    unsafe { copy_string_attr(popup, "AXRole") }.as_deref() == Some("AXPopUpButton")
+        && !value.trim().is_empty()
+        && crate::apps::frontmost_pid() != Some(pid)
+        && !popup_menu_is_open(popup)
+        && is_chromium_popup_owner(pid)
+}
+
 /// Select a background Chromium `<select>` without opening its menu.
 ///
 /// Chromium shows a `<select>` menu as a native popup. Opening it orders the
@@ -937,22 +979,21 @@ const TYPEAHEAD_SETTLE: std::time::Duration = std::time::Duration::from_millis(8
 ///
 /// Returns `None` when this route does not apply or did not land on `value`;
 /// the caller then falls back to opening the menu.
+///
+/// Runs with the window bound as the app's key-routing window (the caller
+/// ran it under `Binding::Keys` because [`typeahead_applies`] held): the
+/// typed label goes to the window's focused element.
 fn select_chromium_popup_by_typeahead(
     popup: AXUIElementRef,
     element_index: usize,
     pid: i32,
-    window_id: u32,
     value: &str,
     element_title: &str,
 ) -> Option<String> {
-    let wanted = value.trim();
-    if wanted.is_empty()
-        || crate::apps::frontmost_pid() == Some(pid)
-        || popup_menu_is_open(popup)
-        || !is_chromium_popup_owner(pid)
-    {
+    if !typeahead_applies(popup, pid, value) {
         return None;
     }
+    let wanted = value.trim();
     let selected = || unsafe { copy_string_attr(popup, "AXValue") }.unwrap_or_default();
     let matches = |current: &str| current.trim().to_lowercase() == wanted.to_lowercase();
     if matches(&selected()) {
@@ -967,13 +1008,6 @@ fn select_chromium_popup_by_typeahead(
     if unsafe { copy_bool_attr(popup, "AXFocused") } != Some(true) {
         return None;
     }
-    // Keys go to the window's focused element, so the window must be the
-    // app's key-routing window: bound in the background through
-    // synthetic_focus (nothing is sent when it already routes keys) and
-    // released when this returns. Unconfirmed: open the menu instead.
-    let _focus =
-        crate::synthetic_focus::enter(pid, window_id, crate::synthetic_focus::Binding::Keys)
-            .ok()?;
     crate::input::keyboard::type_text(pid, wanted).ok()?;
     let deadline = std::time::Instant::now() + TYPEAHEAD_SETTLE;
     loop {
@@ -1002,18 +1036,16 @@ fn select_popup_option(
     element: AXUIElementRef,
     element_index: usize,
     pid: i32,
-    window_id: u32,
     value: &str,
     element_title: &str,
+    typeahead: bool,
 ) -> anyhow::Result<String> {
-    if let Some(detail) = select_chromium_popup_by_typeahead(
-        element,
-        element_index,
-        pid,
-        window_id,
-        value,
-        element_title,
-    ) {
+    if let Some(detail) = typeahead
+        .then(|| {
+            select_chromium_popup_by_typeahead(element, element_index, pid, value, element_title)
+        })
+        .flatten()
+    {
         return Ok(detail);
     }
     let mut options = popup_options(element);

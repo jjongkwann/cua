@@ -106,21 +106,13 @@ impl Tool for TypeTextCharsTool {
         };
 
         // Pre-focus element if requested.
-        if !type_chars_only {
-            if let Some(guard) = element_guard.as_ref().cloned() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::input::ax_actions::focus_element(guard.as_ptr())
-                })
-                .await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        drop(element_guard);
+        let pre_focus = element_guard.filter(|_| !type_chars_only);
 
         // A window-addressed post goes out with that window bound as the
         // app's key-routing window (synthetic_focus, Binding::Keys),
-        // confirmed, or refuses (window_not_key); the binding, the keys and
-        // the release share one blocking thread with the mutation lease.
+        // confirmed, or refuses (window_not_key); the binding, the element
+        // focus, the keys and the release share one blocking thread with the
+        // mutation lease.
         let text_len = text.chars().count();
         let policy = super::keyboard_focus_policy(window_id, false);
         let result = crate::focus_guard::run_blocking_under(
@@ -129,7 +121,13 @@ impl Tool for TypeTextCharsTool {
             policy,
             "type_text_chars.CGEvent",
             &mut _mutation_lease,
-            move || crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms),
+            move || {
+                if let Some(guard) = pre_focus {
+                    let _ = crate::input::ax_actions::focus_element(guard.as_ptr());
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
+            },
         )
         .await;
 
