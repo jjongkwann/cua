@@ -1047,11 +1047,16 @@ fn harness_appkit_invoke_menu_live_path() {
             // A second native process deliberately steals AppKit activation
             // and key-window status. The target menu item validates against
             // both, so an AXFocused-only implementation cannot pass this cell.
-            let _distractor = Harness::launch();
+            let distractor = Harness::launch();
 
-            // invoke_menu does not activate a background app (#4955): with
-            // the distractor in front, the item stays disabled and the call
-            // refuses without touching the fixture.
+            // invoke_menu does not bring a background app to the front
+            // (#4955). It binds the requested window as the app's synthetic
+            // key and main window for the command (synthetic_focus), which
+            // enables the item, presses it, and hands the activation back;
+            // the distractor keeps the front. The fixture's focus oracle
+            // (platform-macos background_focus_oracle) shows the fixture
+            // active with that window key for exactly this one run and
+            // inactive afterwards.
             let background = driver.call(
                 "invoke_menu",
                 serde_json::json!({
@@ -1061,22 +1066,36 @@ fn harness_appkit_invoke_menu_live_path() {
                 }),
             );
             assert!(
-                background.is_error(),
-                "a disabled background menu item was invoked: {}",
+                !background.is_error(),
+                "background invoke_menu failed: {}",
                 background.raw
             );
-            assert_eq!(
-                background.structured()["refusal"]["code"],
-                "background_unavailable",
+            assert_eq!(background.action_effect(), Some("unverifiable"));
+            assert!(
+                background.structured()["actual_delivery"] == "background"
+                    || background.text().contains("not brought to the front"),
                 "{}",
                 background.raw
             );
-            assert!(snapshot_elements(driver, pid, wid)
-                .tree_text()
-                .contains("menu_action=none"));
+            await_menu_action(driver, pid, wid);
+            let apps = driver.call("list_apps", serde_json::json!({}));
+            let distractor_active = apps.structured()["apps"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|app| app["pid"].as_u64() == Some(u64::from(distractor.pid)))
+                .map(|app| app["active"] == true);
+            assert_eq!(
+                distractor_active,
+                Some(true),
+                "the distractor must keep the front across a background invoke_menu: {}",
+                apps.raw
+            );
 
-            // The foreground route the refusal names: bring the exact window
-            // to front, then invoke the menu.
+            // The foreground route: bring the exact window to front, then
+            // invoke the menu. The fixture's label already reads
+            // window_arrange_left from the background run, so this leg proves
+            // the call and the activation hand-off, not the label.
             let raised = driver.call(
                 "bring_to_front",
                 serde_json::json!({"pid": pid, "window_id": wid}),
@@ -1097,24 +1116,28 @@ fn harness_appkit_invoke_menu_live_path() {
                 invoked.text()
             );
             assert_eq!(invoked.action_effect(), Some("unverifiable"));
-            // Poll for the fixture's menu_action instead of sleeping a fixed
-            // 300 ms: a loaded runner delivers the action later.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                let post = snapshot_elements(driver, pid, wid);
-                if post.tree_text().contains("menu_action=window_arrange_left") {
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "menu action did not reach fixture: {}",
-                    post.tree_text()
-                );
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            await_menu_action(driver, pid, wid);
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         },
     );
+}
+
+/// Poll for the fixture's Arrange Left label instead of sleeping a fixed
+/// 300 ms: a loaded runner delivers the action later.
+fn await_menu_action(driver: &mut McpDriver, pid: u32, wid: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let post = snapshot_elements(driver, pid, wid);
+        if post.tree_text().contains("menu_action=window_arrange_left") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "menu action did not reach fixture: {}",
+            post.tree_text()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// A path that fails after opening a menu closes it again: the next command
