@@ -606,7 +606,9 @@ pub(super) struct ElementFocus {
 const ELEMENT_FOCUS_READBACK: Duration = Duration::from_millis(200);
 const ELEMENT_FOCUS_POLL: Duration = Duration::from_millis(10);
 
-fn await_element_focused(pid: i32, element_ptr: usize) -> Result<(), String> {
+/// Read the app's focused element back until it is `element_ptr`, for at
+/// most [`ELEMENT_FOCUS_READBACK`].
+pub(super) fn await_element_focused(pid: i32, element_ptr: usize) -> Result<(), String> {
     let deadline = std::time::Instant::now() + ELEMENT_FOCUS_READBACK;
     loop {
         if crate::input::ax_actions::is_element_focused(pid, element_ptr) {

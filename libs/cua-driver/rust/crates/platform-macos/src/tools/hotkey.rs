@@ -518,6 +518,26 @@ impl Tool for HotkeyTool {
         let policy = super::keyboard_focus_policy(window_id, fg);
         let snapshot = policy.snapshot(prior_front, pid);
 
+        // A background combo to an element: its focus is written now, while
+        // the app is inactive, and read back inside the binding before any
+        // key goes out, as the menu route does. Written while the app
+        // believes it is active, the focus orders the element's window above
+        // the user's front window (docs/macos-synthetic-focus.md, fact 11).
+        if let Some(ptr) = element_ptr.filter(|_| !fg && !coordinate_focus) {
+            let written =
+                tokio::task::spawn_blocking(move || crate::input::ax_actions::focus_element(ptr))
+                    .await;
+            if let Err(error) = written
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|e| e.to_string()))
+            {
+                return ToolResult::error(format!(
+                    "hotkey: the requested element could not be focused ({error}), so no key \
+                     was sent."
+                ));
+            }
+        }
+
         let result = focus_guard::run_blocking_under(
             pid,
             prior_front,
@@ -573,7 +593,12 @@ impl Tool for HotkeyTool {
                     // background (default): auth-envelope post to the pid, no
                     // raise — even when window_id was supplied for targeting.
                     (false, false, _, Some(ptr)) => {
-                        focus_hotkey_element(pid, ptr)?;
+                        super::invoke_menu::await_element_focused(pid, ptr).map_err(|reason| {
+                            anyhow::anyhow!(
+                                "the requested element did not take focus ({reason}), so no \
+                                 key was sent"
+                            )
+                        })?;
                         crate::input::keyboard::hotkey(pid, &key, &m)
                     }
                     _ => crate::input::keyboard::hotkey(pid, &key, &m),
