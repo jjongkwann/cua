@@ -50,9 +50,9 @@
 //! user's, and left alone).
 //!
 //! A [`Binding::Keys`] request for a window that already routes keys sends
-//! nothing. For a target the user has in front it switches the app's key
-//! window in place, as a foreground key post would, and switches it back
-//! without telling the front app to resign.
+//! nothing. For a target the user has in front, any other window is refused
+//! before any record ([`Refusal::FrontAppWindowNotKey`]): making it key would
+//! switch the key window of the app the user is typing in.
 //!
 //! A [`Binding::Key`] request is also confirmed when the window that took key
 //! is a sheet attached to the requested window: AppKit keys the sheet, and a
@@ -185,6 +185,10 @@ pub enum Refusal {
     },
     /// Every record post failed with the invalid-connection status (1002).
     WindowServerConnection,
+    /// `pid` is the user's front app and `window` does not route its keys:
+    /// keys for it would need the app's key window switched, taking the
+    /// user's keyboard.
+    FrontAppWindowNotKey { window: u32 },
 }
 
 impl fmt::Display for Refusal {
@@ -225,6 +229,13 @@ impl fmt::Display for Refusal {
                 f,
                 "the WindowServer connection is invalid (SLPSPostEventRecordTo returned 1002); \
                  nothing was sent"
+            ),
+            Refusal::FrontAppWindowNotKey { window } => write!(
+                f,
+                "window {window} is not the key window of the app the user is using; sending \
+                 keys there would switch that app's key window and take the user's keyboard; \
+                 nothing was sent. Use type_text with the field's element_token (it writes \
+                 through accessibility), or ask the user to switch to that window"
             ),
         }
     }
@@ -424,10 +435,6 @@ struct Bound {
     /// The app's on-screen windows before binding, front to back.
     order_before: Vec<u32>,
     confirmed: bool,
-    /// The target was the front process when bound: its key window was
-    /// switched in place, and it is told to resign on exit only when it is no
-    /// longer the front process by then.
-    in_front: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -483,8 +490,8 @@ fn enter_with<H: Host>(
 ) -> Result<Entered, Refusal> {
     let front_before = host.front_process();
     let in_front = front_before == Some(pid);
-    // A target the user has in front is active for real. Only a key post may
-    // still need its key window switched inside the app.
+    // A target the user has in front is active for real. Only a key post to
+    // a window that does not route its keys is decided below.
     if in_front && binding != Binding::Keys {
         return Ok(Entered::Passive(Passive::TargetInFront));
     }
@@ -502,12 +509,18 @@ fn enter_with<H: Host>(
     if binding == Binding::Keys && before.routes_keys(window) {
         return Ok(Entered::Passive(Passive::AlreadyRoutes));
     }
+    // Keys for another window of the app the user is typing in would need
+    // its key window switched under the user. Refused, as Codex's computer
+    // use never addresses a window other than the app's key window.
+    if in_front {
+        return Err(Refusal::FrontAppWindowNotKey { window });
+    }
     let order_before = host.window_order(pid);
     let mut posted = true;
     if before.frontmost == Some(true) {
-        // The app already believes it is active (it is in front, or an
-        // earlier action left it so). The make-key pair binds a window only
-        // while the app goes active, so have it resign first.
+        // The app already believes it is active (an earlier action left it
+        // so). The make-key pair binds a window only while the app goes
+        // active, so have it resign first.
         posted &= host.post_deactivation(pid, before.focused.unwrap_or(window));
         host.settle(RECORD_SETTLE);
     }
@@ -526,7 +539,6 @@ fn enter_with<H: Host>(
         previous: before.focused,
         order_before,
         confirmed: false,
-        in_front,
     };
     let budget = match binding {
         Binding::Active => ACTIVE_READBACK,
@@ -585,9 +597,9 @@ fn enter_with<H: Host>(
 }
 
 /// Whether the target has come to the front since it was bound, and who
-/// brought it there. A target bound while in front is not asked.
+/// brought it there.
 fn front_taken<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
-    if bound.in_front || host.front_process() != Some(bound.pid) {
+    if host.front_process() != Some(bound.pid) {
         return None;
     }
     Some(if host.user_input_recently() {
@@ -597,22 +609,11 @@ fn front_taken<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
     })
 }
 
-/// Whether the release ends with the deactivation notice: always for a target
-/// bound in the background, and for a target bound in front once it is no
-/// longer WindowServer's front process (the user left it during the call),
-/// so a background app is not left believing it is active.
-fn ends_resigned<H: Host>(host: &mut H, bound: &Bound) -> bool {
-    !bound.in_front || host.front_process() != Some(bound.pid)
-}
-
 /// Hand the activation back: the previous key window first, when the binding
-/// moved it and it still exists, then the deactivation notice. A target that
-/// is in front keeps its activation and only gets its key window back, unless
-/// the user moved its key window to another window during the call: that
-/// choice stands. The front process is re-read before every record: once a
-/// target bound in the background has come to the front, nothing more is
-/// sent (a user who just activated it keeps it active; a target that
-/// activated itself is the reactive layer's).
+/// moved it and it still exists, then the deactivation notice. The front
+/// process is re-read before every record: once the target has come to the
+/// front, nothing more is sent (a user who just activated it keeps it active;
+/// a target that activated itself is the reactive layer's).
 fn exit_bound<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
     macro_rules! stop_if_front {
         () => {
@@ -628,15 +629,7 @@ fn exit_bound<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
         };
     }
     stop_if_front!();
-    // In a target the user has in front, a confirmed binding held the bound
-    // window key; another focused window now is the user's doing (a click in
-    // another of its windows), not the binding's.
-    let key_moved_since = bound.in_front
-        && bound.confirmed
-        && matches!(host.target_state(bound.pid).focused,
-            Some(focused) if focused != bound.window);
     let restore = match (bound.binding, bound.previous) {
-        _ if key_moved_since => None,
         (Binding::Active, _) | (_, None) => None,
         (_, Some(previous)) if previous == bound.window => None,
         (_, Some(previous)) => skylight::restore_target(
@@ -650,7 +643,7 @@ fn exit_bound<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
         Some(previous) => {
             // The pair binds a window only while the app goes active: resign,
             // activate naming the previous window, bind it, then resign for
-            // good unless the app is in front for real.
+            // good.
             host.post_deactivation(bound.pid, bound.window);
             host.settle(RECORD_SETTLE);
             stop_if_front!();
@@ -658,18 +651,25 @@ fn exit_bound<H: Host>(host: &mut H, bound: &Bound) -> Option<FrontAtExit> {
             host.settle(RECORD_SETTLE);
             stop_if_front!();
             host.post_make_key(bound.pid, previous);
-            if ends_resigned(host, bound) {
-                host.settle(RECORD_SETTLE);
-                stop_if_front!();
-                host.post_deactivation(bound.pid, previous);
-            }
+            host.settle(RECORD_SETTLE);
+            stop_if_front!();
+            host.post_deactivation(bound.pid, previous);
         }
-        None if !ends_resigned(host, bound) => {}
         None => {
             host.post_deactivation(bound.pid, bound.window);
         }
     }
     None
+}
+
+/// [`Refusal::FrontAppWindowNotKey`] when `pid` is the user's front app and
+/// `window` does not route its keys: the check [`enter`] makes for a
+/// [`Binding::Keys`], for a caller that decides before binding (type_text's
+/// accessibility-only route).
+pub(crate) fn front_app_refusal(pid: i32, window: u32) -> Option<Refusal> {
+    let mut host = Live;
+    (host.front_process() == Some(pid) && !host.target_state(pid).routes_keys(window))
+        .then_some(Refusal::FrontAppWindowNotKey { window })
 }
 
 /// Releases a binding when dropped, so the release runs after the action
@@ -1357,40 +1357,33 @@ mod tests {
     }
 
     #[test]
-    fn keys_to_a_front_targets_other_window_switch_key_in_place_and_switch_back() {
-        let mut script = Script::background(TARGET, MAIN);
-        script.fronts = [Some(TARGET)].into();
-        script.order = vec![MAIN, SIBLING];
-        script.states = [TargetState {
-            frontmost: Some(true),
-            focused: Some(MAIN),
-            main: Some(MAIN),
-            element: Some(MAIN),
-            sheet_parent: None,
-        }]
-        .into();
-        let mut fake = Fake::new(script);
-        let (report, result) = run(&mut fake, SIBLING, Binding::Keys);
-        assert_eq!(result, Ok("dispatched"));
-        assert!(report.synthetic && report.confirmed);
-        assert_eq!(
-            fake.ops(),
-            vec![
-                Op::ProtectKeyFocus(TARGET),
-                // In place: resign, activate naming the sibling, bind it.
-                Op::Deactivation(TARGET, MAIN),
-                Op::Activation(TARGET, SIBLING),
-                Op::MakeKey(TARGET, SIBLING),
-                Op::Dispatch,
-                // Back to the previous window; the front app is not told to
-                // resign at the end.
-                Op::Deactivation(TARGET, SIBLING),
-                Op::Activation(TARGET, MAIN),
-                Op::MakeKey(TARGET, MAIN),
-            ],
-            "{:?}",
-            fake.ops()
-        );
+    fn keys_to_a_front_targets_window_that_does_not_route_them_refuse_before_any_record() {
+        // The user's front app: another of its windows, and its focused window
+        // while the focused element is in another window (a panel's field).
+        for (window, state) in [
+            (SIBLING, front_target_state(MAIN)),
+            (
+                MAIN,
+                TargetState {
+                    element: Some(SIBLING),
+                    ..front_target_state(MAIN)
+                },
+            ),
+        ] {
+            let mut script = Script::background(TARGET, MAIN);
+            script.fronts = [Some(TARGET)].into();
+            script.order = vec![MAIN, SIBLING];
+            script.states = [state].into();
+            let mut fake = Fake::new(script);
+            let (report, result) = run(&mut fake, window, Binding::Keys);
+            assert_eq!(result, Err(Refusal::FrontAppWindowNotKey { window }));
+            assert_eq!(report, Report::default());
+            assert_eq!(
+                fake.ops(),
+                vec![Op::ProtectKeyFocus(TARGET)],
+                "no record, no dispatch: the user's key window stays"
+            );
+        }
     }
 
     /// A front target whose `focused` window is key and holds the focused
@@ -1403,100 +1396,6 @@ mod tests {
             element: Some(focused),
             sheet_parent: None,
         }
-    }
-
-    const THIRD: u32 = 502;
-
-    #[test]
-    fn a_front_target_the_user_leaves_during_the_switch_ends_resigned() {
-        let mut script = Script::background(TARGET, MAIN);
-        // Reads: before binding, after binding, at the end of the release
-        // (the user has switched to another app).
-        script.fronts = [Some(TARGET), Some(TARGET), Some(USER)].into();
-        script.order = vec![MAIN, SIBLING];
-        script.states = [front_target_state(MAIN)].into();
-        let mut fake = Fake::new(script);
-        let (_, result) = run(&mut fake, SIBLING, Binding::Keys);
-        assert_eq!(result, Ok("dispatched"));
-        assert_eq!(
-            fake.ops(),
-            vec![
-                Op::ProtectKeyFocus(TARGET),
-                Op::Deactivation(TARGET, MAIN),
-                Op::Activation(TARGET, SIBLING),
-                Op::MakeKey(TARGET, SIBLING),
-                Op::Dispatch,
-                Op::Deactivation(TARGET, SIBLING),
-                Op::Activation(TARGET, MAIN),
-                Op::MakeKey(TARGET, MAIN),
-                // Now in the background: the release ends resigned.
-                Op::Deactivation(TARGET, MAIN),
-            ],
-            "{:?}",
-            fake.ops()
-        );
-    }
-
-    #[test]
-    fn a_key_window_the_user_picks_in_a_front_target_is_not_restored_over() {
-        let mut script = Script::background(TARGET, MAIN);
-        script.fronts = [Some(TARGET)].into();
-        script.order = vec![MAIN, SIBLING, THIRD];
-        // Reads: before binding, the binding's readback, and at exit the
-        // user has clicked a third window of the app.
-        script.states = [
-            front_target_state(MAIN),
-            front_target_state(SIBLING),
-            front_target_state(THIRD),
-        ]
-        .into();
-        let mut fake = Fake::new(script);
-        fake.follow_records = false;
-        let (report, result) = run(&mut fake, SIBLING, Binding::Keys);
-        assert_eq!(result, Ok("dispatched"));
-        assert!(report.confirmed);
-        assert_eq!(
-            fake.ops(),
-            vec![
-                Op::ProtectKeyFocus(TARGET),
-                Op::Deactivation(TARGET, MAIN),
-                Op::Activation(TARGET, SIBLING),
-                Op::MakeKey(TARGET, SIBLING),
-                Op::Dispatch,
-            ],
-            "the user's key window stays: {:?}",
-            fake.ops()
-        );
-    }
-
-    #[test]
-    fn a_front_target_the_user_moves_and_leaves_ends_resigned_without_a_restore() {
-        let mut script = Script::background(TARGET, MAIN);
-        script.fronts = [Some(TARGET), Some(TARGET), Some(USER)].into();
-        script.order = vec![MAIN, SIBLING, THIRD];
-        script.states = [
-            front_target_state(MAIN),
-            front_target_state(SIBLING),
-            front_target_state(THIRD),
-        ]
-        .into();
-        let mut fake = Fake::new(script);
-        fake.follow_records = false;
-        let (_, result) = run(&mut fake, SIBLING, Binding::Keys);
-        assert_eq!(result, Ok("dispatched"));
-        assert_eq!(
-            fake.ops(),
-            vec![
-                Op::ProtectKeyFocus(TARGET),
-                Op::Deactivation(TARGET, MAIN),
-                Op::Activation(TARGET, SIBLING),
-                Op::MakeKey(TARGET, SIBLING),
-                Op::Dispatch,
-                Op::Deactivation(TARGET, SIBLING),
-            ],
-            "{:?}",
-            fake.ops()
-        );
     }
 
     #[test]
@@ -1884,6 +1783,7 @@ mod tests {
                 after: Some(2),
             },
             Refusal::WindowServerConnection,
+            Refusal::FrontAppWindowNotKey { window: MAIN },
         ] {
             let text = refusal.to_string();
             assert!(

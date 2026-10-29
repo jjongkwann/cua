@@ -883,9 +883,28 @@ async fn background_keyboard_policy(
     let target = ExactWindowTarget { pid, window_id };
     // The exact window is bound as the app's key-routing window for the key
     // post (see `super::keyboard_focus_policy`), so a sibling window is not
-    // ambiguous.
+    // ambiguous. In the user's front app only the window that already routes
+    // keys can take them (`synthetic_focus::front_app_refusal`); any other
+    // window keeps the accessibility write alone.
     let action = super::window_keyboard_action(BackgroundAction::InsertText);
-    match decide_background_input(target, &facts, action) {
+    let front_app_refusal = tokio::task::spawn_blocking(move || {
+        crate::synthetic_focus::front_app_refusal(pid, window_id)
+    })
+    .await
+    .ok()
+    .flatten()
+    .map(
+        |refusal| cua_driver_core::background_input::BackgroundRefusal {
+            code: super::FRONT_APP_WINDOW_NOT_KEY,
+            reason: refusal.to_string(),
+            advice: None,
+        },
+    );
+    let decision = match front_app_refusal {
+        Some(refusal) => BackgroundInputDecision::Refuse(refusal),
+        None => decide_background_input(target, &facts, action),
+    };
+    match decision {
         BackgroundInputDecision::Execute { .. } => Ok((lease, BackgroundKeyboardPolicy::Allowed)),
         BackgroundInputDecision::Refuse(refusal) => {
             let semantic_available = element_ptr.is_some()

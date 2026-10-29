@@ -212,15 +212,23 @@ with no key window (`background_focus_oracle` against ded0c1748).
   ignores both passes is refused (`window_not_key`). The exit restores a
   window the binding moved with the records, after a write too (the earlier
   primer restored with another write).
-- For a target the user has in front, `Keys` switches the app's key window in
-  place (deactivation notice, activation notice naming the window, pair), as
-  the earlier primer did, and switches it back without telling the front app
-  to resign. Two exceptions at exit: a target that is no longer WindowServer's
-  front process by the end of the release (the user switched away during the
-  call) gets the final deactivation, so it is not left believing it is active
-  in the background; and when the user moved the app's key window to another
-  of its windows during a confirmed switch, that window stays key and the
-  previous one is not restored over it.
+- For a target the user has in front (WindowServer's front process), `Keys`
+  passes only for the window that already routes keys (the app's focused
+  window holding its focused element). Any other window is refused before
+  any record with `front_app_window_not_key`. Making it key would switch the
+  key window of the app the user is typing in: for the length of the call,
+  the user's keys would go nowhere or into that window, mixed with the
+  driver's, and the user's window would get resign and become-active
+  notifications. The earlier primer, and this module until now, switched the
+  key window in place and back. Codex's computer-use tools take only an app,
+  with no window argument, and act on the app's key window, so they never
+  switch the key window of the user's front app; this refusal keeps the
+  driver to the same rule. `type_text` with the field's `element_token` still
+  writes through accessibility there: its gate makes that write the only
+  route (`SemanticOnly`), with no binding and no key, and returns the refusal
+  if the write does not land. Without an element token, `type_text` refuses
+  as the other key tools do. `Key`, `KeyMain` and `Active` bindings for a
+  front target stay passive.
 - The key tools run their key post on the blocking thread that holds the
   binding and the per-PID lease (`focus_guard::run_blocking_under`), so a
   dropped caller future still releases the binding after the keys. A key
@@ -228,8 +236,9 @@ with no key window (`background_focus_oracle` against ded0c1748).
   and releases its own `Active` context.
 - Refusals name the condition: `window_not_key` (a key binding the readback
   did not confirm), `window_not_found` or `owner_pid_mismatch` (the window is
-  not the target's), `front_changed` (the front process moved while binding)
-  and the WindowServer-connection refusal.
+  not the target's), `front_changed` (the front process moved while binding),
+  `front_app_window_not_key` (keys for a window of the user's front app that
+  does not route them) and the WindowServer-connection refusal.
 - The deactivation notice at exit closes transient UI the action opened
   (fact 12). The binding is not kept open for it: a binding that outlives its
   action leaves the target believing it is active while the user works, which
@@ -246,9 +255,11 @@ with no key window (`background_focus_oracle` against ded0c1748).
   versus target at exit, sheet acceptance with no sheet restore, checked by
   reverting the fix and watching the test fail, sibling restore, the lease
   released only after the binding, the `Keys` readback (element wait, second
-  pass, the `AXFocusedWindow` write only without a focused element), the
-  in-place switch ending resigned when the user leaves and keeping a key
-  window the user picked, each checked by breaking it; focus_guard:
+  pass, the `AXFocusedWindow` write only without a focused element), a key
+  post to a window of the user's front app that does not route keys refused
+  before any record (another window, and the focused window with the
+  focused element elsewhere), checked by breaking it, and the front app's
+  routing window passing with no record; focus_guard:
   suppression per policy;
   invoke_menu: refusal mapping; click) and `cargo test -p cua-driver-core --lib`.
 - Native, on this Mac, `cargo test -p platform-macos --test background_focus_oracle -- --run-gui`,
@@ -283,17 +294,12 @@ with no key window (`background_focus_oracle` against ded0c1748).
   Automation, a browser). They are the next callers to move.
 - The hotkey routes with an element in a sibling window (hypothesis above);
   `Keys` on a LibreOffice that has never been active (the case the binding
-  exists for) and on a front target's other window, beyond the hermetic
-  sequence tests.
-- Follow-up: the in-place switch in a target the user has in front takes the
-  user's own typing. From the first deactivation notice to the switch back
-  (about half a second) keys the user types go nowhere or into the bound
-  window, mixed with the driver's, and the user's window gets resign and
-  become-active notifications (a browser page sees blur and focus). The
-  key-focus guard is not armed for a front target. The switch is kept as the
-  earlier primer had it; refusing a background key post to another window of
-  the user's front app (advising `delivery_mode:"foreground"`) or measuring
-  the interception is open.
+  exists for), beyond the hermetic sequence tests.
+- The `front_app_window_not_key` refusal natively: it needs the target to be
+  the user's front app, which the background oracle never makes it. So does
+  `type_text`'s accessibility-only write into a non-key window of the front
+  app; whether a field there takes `AXSelectedText` without becoming key was
+  not observed.
 - Chromium, Electron and Catalyst targets under the `Active` binding beyond
   what the pixel prologue already did; Space preservation; what AppKit keys
   on the user's next real activation of a target whose key window the driver

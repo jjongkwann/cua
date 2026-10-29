@@ -324,6 +324,7 @@ pub(crate) fn synthetic_focus_refusal(
         Refusal::NotOwned { owner: Some(_), .. } => (refusal_codes::OWNER_PID_MISMATCH, None),
         Refusal::Unconfirmed { .. } => (WINDOW_NOT_KEY, Some("foreground")),
         Refusal::FrontChanged { .. } => (FRONT_CHANGED, None),
+        Refusal::FrontAppWindowNotKey { .. } => (FRONT_APP_WINDOW_NOT_KEY, None),
     };
     background_refusal_result(
         pid,
@@ -494,6 +495,11 @@ pub(crate) const FRONT_CHANGED: &str = "front_changed";
 /// Refusal code when the addressed window cannot be confirmed as the app's
 /// key window: no key is sent, none could be proven to reach it.
 pub(crate) const WINDOW_NOT_KEY: &str = "window_not_key";
+
+/// Refusal code when keys address a window of the user's front app that is
+/// not its key window: posting them would switch the key window under the
+/// user. Nothing is sent.
+pub(crate) const FRONT_APP_WINDOW_NOT_KEY: &str = "front_app_window_not_key";
 
 /// Acquire the per-PID mutation coordinator, gather fresh exact-target facts,
 /// and ask the pure core for one background decision. `element_ptr` must stay
