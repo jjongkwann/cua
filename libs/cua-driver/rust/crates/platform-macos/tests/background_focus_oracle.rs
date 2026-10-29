@@ -782,11 +782,11 @@ mod native {
                         &ctx.runtime,
                         &ctx.registry,
                         "press_key",
-                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "key": "k" }),
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "key": "7" }),
                     );
                     with_input_value(result, fixture)
                 },
-                expect: |_, result, _| expect_typed("k", result),
+                expect: |_, result, _| expect_typed("7", result),
             },
             Case {
                 name: "hotkey_keys_in_background_window",
@@ -803,11 +803,11 @@ mod native {
                         &ctx.runtime,
                         &ctx.registry,
                         "hotkey",
-                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "keys": ["shift", "m"] }),
+                        json!({ "pid": fixture.pid, "window_id": fixture.main, "element_token": token, "keys": ["shift", "1"] }),
                     );
                     with_input_value(result, fixture)
                 },
-                expect: |_, result, _| expect_typed("M", result),
+                expect: |_, result, _| expect_typed("!", result),
             },
             Case {
                 // The sibling window holds only a label: the key has nowhere
