@@ -515,6 +515,17 @@ fn enter_with<H: Host>(
     if in_front {
         return Err(Refusal::FrontAppWindowNotKey { window });
     }
+    // A sheet over the requested window takes the key status a make-key pair
+    // would give the window, and that pair moves WindowServer's key focus to
+    // the target, raising its window over the user's (fact 10). A binding
+    // that needs the window itself key is refused before any record.
+    if matches!(binding, Binding::KeyMain | Binding::Keys) && before.sheet_parent == Some(window) {
+        return Err(Refusal::Unconfirmed {
+            window,
+            binding,
+            state: before,
+        });
+    }
     let order_before = host.window_order(pid);
     let mut posted = true;
     if before.frontmost == Some(true) {
@@ -1705,7 +1716,9 @@ mod tests {
                 matches!(result, Err(Refusal::Unconfirmed { .. })),
                 "{binding:?}: {result:?}"
             );
-            assert!(!fake.ops().contains(&Op::Dispatch));
+            // Refused before any record: no pair moves key focus to the
+            // target.
+            assert_eq!(fake.ops(), vec![Op::ProtectKeyFocus(TARGET)], "{binding:?}");
         }
     }
 
