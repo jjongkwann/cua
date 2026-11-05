@@ -2,14 +2,16 @@
 // Copyright (c) 2026 Cua AI, Inc.
 
 import { XIcon } from "lucide-react";
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import { Minimize2Icon } from "lucide-react";
 
 import { Tooltip } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/utils";
 
+import { markAsked, usePreparedQueue, usePrepare } from "@/lib/prepare/store";
 import { harnessName, queuedNote, summonPlan, useBridge, type SpaceFact, type SpaceThread, type StreamRow, type ThreadAttachment, type ThreadView as PostView } from "@/bridge";
+import { useNetworkSheetFor } from "@/components/network/use-network";
 import { Dialog, DialogPopup, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "@/components/ui/toast";
 
@@ -17,7 +19,10 @@ import { AddAgentSheet } from "@/components/add-agent/add-agent-sheet";
 import { registerAddAgent } from "@/components/add-agent/add-agent-launcher";
 
 import { CallSplit } from "./call-split";
-import { Composer } from "./composer";
+import { defaultAddressee, EMPTY_ADDRESS, resolveAddressing, setAddress, unpinAgent, useAddressing } from "@/lib/addressing";
+import { EVERYONE, type MentionCandidate } from "@/lib/mentions";
+
+import { Composer, type ComposerHandle } from "./composer";
 import { LiveRows } from "./live-row";
 import { MembersPanel, type MemberPresence } from "./members-panel";
 import { panelFacts } from "./rail";
@@ -30,6 +35,9 @@ import { ProfileScopeProvider } from "./profile-card";
 import { queuedItems, useQueued } from "./queued";
 import { ThreadView } from "./thread-view";
 
+
+/** Why `@everyone` is off for someone who can't give tasks. */
+const EVERYONE_REASON = "Only people who can give tasks can message everyone";
 
 /**
  * A Space as a call (the call storyboard): the header, the desktop on top
@@ -46,6 +54,7 @@ export function SpaceCall({
   thread,
   identity,
   facts,
+  detailsExtra,
   more,
   windows,
   desktop,
@@ -54,6 +63,7 @@ export function SpaceCall({
   view,
   onStream,
   presence,
+  owner,
   onShare,
   layout = "call",
   onLayout,
@@ -81,6 +91,8 @@ export function SpaceCall({
   thread: SpaceThread;
   identity: string | null;
   facts: readonly SpaceFact[];
+  /** Rows after the facts, before More (the Network row). */
+  detailsExtra?: ReactNode;
   /** The classic page's sections (resources, all facts, Teleport, windows, runs). */
   more: ReactNode;
   /** The Space's windows (Stream rows without the desktop). */
@@ -96,6 +108,8 @@ export function SpaceCall({
   /** Opens a row in its own window. */
   onStream: (row: StreamRow) => void;
   presence?: MemberPresence;
+  /** Whose Space this is, when it was shared with you (the owner is in the room too). */
+  owner?: { name: string; email?: string | null } | null;
   /** Opens Share for this Space (Add an agent offers it; absent: sharing isn't offered here). */
   onShare?: () => void;
   /** The Space is still being made: the composer queues, nothing joins yet (`thread` is `creatingThread`). */
@@ -104,10 +118,15 @@ export function SpaceCall({
   const { core, data } = useBridge();
   const [folded, setFolded] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
+  // One dialog at a time: the Network sheet replaces the details it was opened from.
+  const networkOpen = useNetworkSheetFor() !== null;
+  useEffect(() => {
+    if (networkOpen) setMoreOpen(false);
+  }, [networkOpen]);
   const [addOpen, setAddOpen] = useState(false);
   const roster = useMemo(
-    () => buildRoster({ members: thread.members, shares: thread.shares, entries: thread.entries, me: thread.me, identity, role: thread.role, harnessName: (h) => harnessName(core, h) }),
-    [thread.members, thread.shares, thread.entries, thread.me, thread.role, identity, core],
+    () => buildRoster({ members: thread.members, shares: thread.shares, entries: thread.entries, me: thread.me, identity, role: thread.role, owner, harnessName: (h) => harnessName(core, h) }),
+    [thread.members, thread.shares, thread.entries, thread.me, thread.role, identity, owner, core],
   );
   // Anyone who can post can add an agent; a guest only reads.
   const canAdd = !creating && thread.status === "ready" && thread.role !== "guest";
@@ -148,12 +167,16 @@ export function SpaceCall({
   const queued = useQueued(spaceId);
   const myName = roster.people.find((p) => p.me)?.label ?? "";
   const queuedLine = queuedNote(core, creating);
+  // Messages kept for the home being prepared send when its agent is ready, which is later than the Space.
+  const prepared = usePrepare();
+  const preparedQueue = usePreparedQueue(spaceId);
+  const preparedWords = preparedQueue.length ? prepared.view?.queued[0]?.note : undefined;
   const items = useMemo(() => [...thread.items, ...queuedItems(queued, thread.me ?? "me", myName)], [thread.items, thread.me, queued, myName]);
   const after = (seq: number) =>
     seq < 0 ? (
       <div data-queued-note="" data-only-you="" className="-mt-0.5 mb-1 ml-11 w-fit rounded-lg bg-brand-surface px-2.5 py-1.5">
         <OnlyYou label={queuedLine?.onlyYouLabel ?? ""} />
-        <p className="text-xs text-muted-foreground">{queuedLine?.text}</p>
+        <p className="text-xs text-muted-foreground">{preparedWords ?? queuedLine?.text}</p>
       </div>
     ) : (
       notes?.filter((n) => n.seq === seq).map(noteView)
@@ -172,6 +195,66 @@ export function SpaceCall({
     onSetRights: thread.role === "guest" ? undefined : thread.setRights,
     selected: selectedMember,
     select: setSelectedMember,
+  };
+  // Who a message goes to when it names no agent (the chip), and `@everyone`.
+  const stored = useAddressing((st) => st.bySpace[spaceId]);
+  const address = stored ?? EMPTY_ADDRESS;
+  const inSpace = useMemo(() => roster.agents.map((a) => a.handle.toLowerCase()), [roster.agents]);
+  const mayTask = thread.role !== "guest" && roster.agents.some((a) => a.youCan.task);
+  const everyoneOffered = !creating && roster.agents.length > 1;
+  const candidates = useMemo<MentionCandidate[]>(() => {
+    if (!everyoneOffered) return summon.candidates;
+    const all: MentionCandidate = { handle: EVERYONE, label: "Everyone", kind: "agent", detail: mayTask ? "All agents you can give tasks" : EVERYONE_REASON, disabled: !mayTask };
+    const lastAgent = summon.candidates.map((c) => c.kind).lastIndexOf("agent");
+    return [...summon.candidates.slice(0, lastAgent + 1), all, ...summon.candidates.slice(lastAgent + 1)];
+  }, [summon.candidates, everyoneOffered, mayTask]);
+  const known = useMemo(() => (everyoneOffered && mayTask ? new Set([...summon.handles, EVERYONE]) : summon.handles), [summon.handles, everyoneOffered, mayTask]);
+  const agentHandles = useMemo(() => new Set([...inSpace, ...summon.candidates.filter((c) => c.kind === "agent").map((c) => c.handle.toLowerCase())]), [inSpace, summon.candidates]);
+  const addressee = useMemo(() => defaultAddressee({ agents: inSpace, canEveryone: everyoneOffered && mayTask, state: address }), [inSpace, everyoneOffered, mayTask, address]);
+  const nameOf = (h: string) => (h === EVERYONE ? "Everyone" : (roster.agents.find((a) => a.handle.toLowerCase() === h)?.label ?? h));
+  const problemOf = (h: string): string | null => {
+    const a = roster.agents.find((x) => x.handle.toLowerCase() === h);
+    if (!a) return null;
+    if (a.status === "failed") return a.failure?.class === "needs_connect" ? `${a.label} needs to be connected` : `${a.label} couldn't start`;
+    if (a.identity?.state === "pending") return `${a.label} isn't connected yet`;
+    return null;
+  };
+  // Reply on an agent's message: its @handle goes in the box; the message is posted as a reply to it.
+  const composerRef = useRef<ComposerHandle | null>(null);
+  const replying = useRef<{ seq: number; handle: string } | null>(null);
+  const onReply = useCallback((handle: string, seq: number) => {
+    replying.current = { seq, handle: handle.toLowerCase() };
+    composerRef.current?.reply(handle);
+  }, []);
+  // ⌘⇧A (Ctrl+Shift+A): reply to the latest message from an agent that is still here (⌘⇧R is a reload in the desktop app).
+  useEffect(() => {
+    if (creating) return;
+    const onKey = (e: KeyboardEvent) => {
+      const mod = isMacPlatform() ? e.metaKey : e.ctrlKey;
+      if (!(mod && e.shiftKey && !e.altKey && e.key.toLowerCase() === "a")) return;
+      for (let i = thread.items.length - 1; i >= 0; i--) {
+        const it = thread.items[i]!;
+        if (!("entry" in it) || it.entry.author.kind !== "agent") continue;
+        const handle = roster.author(it.entry.author).agent?.handle;
+        if (!handle) continue;
+        e.preventDefault();
+        onReply(handle, it.entry.seq);
+        return;
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [creating, thread.items, roster, onReply]);
+  const sendResolved = async (text: string) => {
+    const reply = replying.current;
+    const r = resolveAddressing({ text, agents: inSpace, agentHandles, known, canEveryone: everyoneOffered && mayTask, state: address, replyTo: reply?.handle });
+    const replyTo = reply && r.addressee.handles.includes(reply.handle) ? reply.seq : null;
+    await summon.send(r.text, view ?? null, replyTo);
+    replying.current = null;
+    // The first time a message is addressed for you, say so quietly.
+    const told = address.told || r.auto;
+    setAddress(spaceId, { ...r.next, told });
+    if (r.auto && !address.told) toast(`${r.addressee.handles.map(nameOf).join(" and ")} will be mentioned automatically`, { description: "Click the X on the name in the box to stop." });
   };
   const harnessOf = (handle: string) => roster.agents.find((a) => a.name === handle)?.harness ?? summon.candidates.find((c) => c.handle === handle)?.harness ?? "";
   // Attachments are Cua Volume paths: show the file where the Volume is mounted.
@@ -198,6 +281,7 @@ export function SpaceCall({
       onOpenAttachment={openAttachment}
       onRemoveAgent={thread.removeAgent ?? undefined}
       onRetry={(text) => summon.send(text, view ?? null)}
+      onReply={creating ? undefined : onReply}
       onReachTop={thread.hasMoreBefore ? thread.loadEarlier : undefined}
       empty={
         thread.status === "loading" ? null : (
@@ -213,11 +297,17 @@ export function SpaceCall({
       {thread.error && thread.items.length ? <p className="px-6 pb-1 text-xs text-muted-foreground">Reconnecting to the thread…</p> : null}
       <div className="px-5 pb-4">
         <Composer
-          placeholder={`Message ${spaceName}`}
-          candidates={summon.candidates}
-          handles={summon.handles}
+          placeholder={!creating && addressee.handles.length ? `Message ${addressee.handles.map(nameOf).join(" and ")}` : `Message ${spaceName}`}
+          candidates={candidates}
+          handles={known}
           agentHarness={harnessOf}
-          onSend={(text) => (creating ? thread.post(text).then(() => undefined) : summon.send(text, view ?? null))}
+          composerRef={composerRef}
+          addressee={
+            creating || !addressee.handles.length
+              ? undefined
+              : { handles: addressee.handles, label: nameOf, problem: problemOf, agentHandles, onRemove: (h) => unpinAgent(spaceId, h, addressee.source) }
+          }
+          onSend={(text) => (creating ? thread.post(text).then(() => undefined) : (markAsked(spaceId), sendResolved(text)))}
           disabled={thread.status !== "ready"}
           disabledReason={thread.role === "guest" ? GUEST_COMPOSER : null}
         />
@@ -280,6 +370,7 @@ export function SpaceCall({
           roster={roster}
           presence={presence}
           facts={panelFacts(facts)}
+          extra={detailsExtra}
           onMore={() => setMoreOpen(true)}
           windows={windows}
           desktop={desktop}

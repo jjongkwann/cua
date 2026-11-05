@@ -171,12 +171,12 @@ describe("this device's access to its machines", () => {
   });
 });
 
-describe("this computer on the relay (CUA-1527)", () => {
+describe("this machine on the relay (CUA-1527)", () => {
   const HOST = "09c8b17b5a55f89bc1e376eaeabf111f";
   const wkSpace = (id: string, name: string, host?: string) => ({ space: { id, name, provider: "relay", status: "running", os: "linux", host, hostName: host ? "lg-x11" : undefined } });
   const status = { configured: true, mode: "relay", machineId: HOST, name: "lg-x11", sharing: true, serviceInstalled: true, serviceRunning: true, serviceKind: "systemd", clients: [], permissions: [] };
 
-  it("lists the machine that is set up for access once, as This computer, with its Spaces", () => {
+  it("lists the machine that is set up for access once, as This machine, with its Spaces", () => {
     const spaces = { spaces: [wkSpace("relay:space-16dec1e7810d08b6", "remote-from-wl", HOST), wkSpace(`relay:${HOST}`, "lg-x11")] };
     const rows = toMachineRows(spaces as never, { devices: null, signedIn: true, host: status } as never, "linux");
     expect(rows.map((r) => r.name)).toEqual(["This machine"]);
@@ -184,7 +184,7 @@ describe("this computer on the relay (CUA-1527)", () => {
     expect(machines).toHaveLength(1);
   });
 
-  it("puts the Spaces this machine provides on This computer", () => {
+  it("puts the Spaces this machine provides on This machine", () => {
     const rows = toMachineRows({ spaces: [wkSpace("relay:space-16dec1e7810d08b6", "remote-from-wl", HOST)] } as never, { devices: null, signedIn: true, host: status } as never, "linux");
     const here = rows.find((r) => r.current)!;
     expect(machineIdOf({ id: "relay:space-16dec1e7810d08b6", provider: "relay", host: HOST }, rows)).toBe(here.id);
@@ -257,7 +257,8 @@ describe("a Space's drop well", () => {
     const seen: string[] = [];
     await sendFiles(demo, core, "local:design-review", ["/Users/ada/notes.txt"], (s) => seen.push(`${s?.kind}: ${s?.text}`));
     expect(seen[0]).toMatch(/^working: Sending notes\.txt/);
-    expect(seen[1]).toMatch(/^done: notes\.txt .* verified in /);
+    // The core words what landed; without it the bridge names the files.
+    expect(seen[1]).toMatch(wasmBuilt ? /^done: notes\.txt .* verified in / : /^done: notes\.txt$/);
     seen.length = 0;
     await sendFiles(demo, core, "local:agent-sandbox", ["/Users/ada/notes.txt"], (s) => seen.push(s!.kind));
     expect(seen).toEqual(["working", "failed"]);

@@ -21,7 +21,7 @@ import type {
   SpacePresenceLike,
   TeleportLike,
 } from "../src/native/generated/index";
-import type { BulkResult, LocalRuntimes, MachineHealthReport, ShareLinkRow, SpaceThumbnailData, SpacesBackend } from "../src/model/backend";
+import type { BulkResult, LocalRuntimes, MachineHealthReport, NetworkEventJson, ShareLinkRow, ShareSettingsRow, SpaceNetworkJson, SpaceThumbnailData, SpacesBackend } from "../src/model/backend";
 import type { StreamWindow } from "../src/model/streams";
 import type { AccountProfile, AccountRunning, LinkNoticeView, SignInAttempt, TelemetryRunning } from "../src/model/services";
 
@@ -215,6 +215,35 @@ export class FixtureSpacesBackend implements SpacesBackend {
     if (value === null) this.runtimeSettings.delete(key);
     else this.runtimeSettings.set(key, value);
   }
+  repoCache = { enabled: true, sizeSetting: "auto", repos: 3, bytes: 1_288_490_189n };
+  private repoCacheOf() {
+    const cap = this.repoCache.sizeSetting === "auto" ? 5 : Number(this.repoCache.sizeSetting);
+    return {
+      enabled: this.repoCache.enabled,
+      repos: this.repoCache.repos,
+      bytes: this.repoCache.bytes,
+      capBytes: BigInt(cap) * 1024n ** 3n,
+      sizeSetting: this.repoCache.sizeSetting,
+      summary: `Repos: ${this.repoCache.repos}, 1.2 GB of ${cap} GB`,
+      week: "Last week: 80% of clones came from the cache, about 2 minutes saved",
+      hits: 8,
+      misses: 2,
+      secondsSaved: 125n,
+    };
+  }
+  async repoCacheStatus() {
+    return this.repoCacheOf();
+  }
+  async setRepoCache(change: { enabled?: boolean; sizeGb?: number | null }) {
+    if (change.enabled !== undefined) this.repoCache.enabled = change.enabled;
+    if (change.sizeGb !== undefined) this.repoCache.sizeSetting = change.sizeGb === null ? "auto" : String(change.sizeGb);
+    return this.repoCacheOf();
+  }
+  async clearRepoCache() {
+    this.repoCache.repos = 0;
+    this.repoCache.bytes = 0n;
+    return this.repoCacheOf();
+  }
   async localStorage() {
     return null;
   }
@@ -285,10 +314,100 @@ export class FixtureSpacesBackend implements SpacesBackend {
       owner: "ada@example.com",
       createdAtUnix: 1_000,
       expiresAtUnix: ttlSeconds ? 1_000 + ttlSeconds : null,
+      tcpConnectWith: null,
+      tcpAddress: null,
+      route: null,
+      routeLine: null,
+      allow: [],
+      waiting: null,
+      waitingText: null,
     };
     this.linksNow = [row, ...this.linksNow];
     return row;
   }
+  async approveLink(id: string, _always: boolean) {
+    const row: ShareLinkRow = this.linksNow.find((l) => l.id === id) ?? {
+      id,
+      url: "tcp://tcp.m.relay.example:26001",
+      name: null,
+      access: "public",
+      kind: "space_port",
+      target: "space:dev:25565",
+      owner: "ada@example.com",
+      createdAtUnix: 1_000,
+      expiresAtUnix: 1_000 + 86_400,
+      tcpConnectWith: "tcp.m.relay.example:26001",
+      tcpAddress: "tcp.m.relay.example:26001",
+      route: "relay",
+      routeLine: "Through Cua",
+      allow: [],
+      waiting: null,
+      waitingText: null,
+    };
+    return { ...row, waiting: null, waitingText: null };
+  }
+  async denyLink(_id: string) {}
+  shareSettingsNow: ShareSettingsRow = {
+    landing: "auto",
+    relayFallback: true,
+    dailyCapMib: 2048,
+    defaultAllow: [],
+    approveAgentShares: true,
+    alwaysAllowSpaces: [],
+    edgeConsent: [],
+    usedToday: 0,
+    edgeCloud: null,
+    edgeHost: null,
+    edgeMonthlyUsd: null,
+  };
+  async shareSettings() {
+    return { ...this.shareSettingsNow };
+  }
+  async setShareSettings(s: ShareSettingsRow) {
+    const cur = this.shareSettingsNow;
+    this.shareSettingsNow = { ...s, usedToday: cur.usedToday, edgeCloud: cur.edgeCloud, edgeHost: cur.edgeHost, edgeMonthlyUsd: cur.edgeMonthlyUsd };
+    return { ...this.shareSettingsNow };
+  }
+  async removeShareEdge() {
+    return [] as string[];
+  }
+  async network(_id: string): Promise<SpaceNetworkJson> {
+    return {
+      preset: "internet",
+      localhostPorts: [],
+      allLocalhostPorts: false,
+      allow: [],
+      deny: [],
+      customBase: "",
+      widenedBy: null,
+      summary: "Internet only",
+      widenings: [],
+      enforcement: "enforced",
+      point: "the host firewall",
+      note: null,
+      parent: null,
+      root: null,
+      alwaysBlocked: [],
+      noticePending: false,
+      via: null,
+      topologyJson: "",
+      clipboard: "viewing",
+      volume: "own",
+    };
+  }
+  async setNetwork(_id: string, _word: string, _allow: string[], _deny: string[], _widen: boolean, _tree: boolean) {
+    return "now" as const;
+  }
+  async networkLog(_id: string): Promise<NetworkEventJson[]> {
+    return [];
+  }
+  async ackNetworkNotice(_id: string) {}
+  /** The Spaces whose exit is this computer, as `exitsThroughThisMachine` reports them. */
+  exitsNow: string[] = [];
+  async exitsThroughThisMachine() {
+    return [...this.exitsNow];
+  }
+  async setAccess(_id: string, _clipboard: string | null, _volume: string | null) {}
   async stopLink(id: string) {
     const gone = this.linksNow.filter((l) => id === "all" || l.id === id).map((l) => l.id);
     this.linksNow = this.linksNow.filter((l) => !gone.includes(l.id));
@@ -382,6 +501,13 @@ export function unconfiguredHost(): HostStatus {
     provideSpaces: false,
     maxSpaces: 4,
     maxMacosVms: 2,
+    maxMemoryGb: 0,
+    maxDiskGb: 0,
+    maxRunMinutes: 0,
+    usedMemoryGb: 0,
+    usedDiskGb: 0,
+    totalMemoryGb: 0,
+    totalDiskGb: 0,
     providedSpaces: [],
     spacesAudit: [],
     spacesAuditError: undefined,

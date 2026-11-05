@@ -46,8 +46,26 @@ export interface AskTask {
   lastStatus: AgentRunStatus | null;
   /** It runs on this Mac itself (its own Space id is in `spaceId`): nothing to throw away. */
   onHost?: boolean;
-  /** Started in its Space's thread (the redesign): the job is the Space's first message, @mentioning the agent. */
+  /** Started in its Space's thread: the job is the Space's first message, @mentioning the agent. */
   inSpace?: boolean;
+  /**
+   * A chat picked from "Pick up where you left off" (CUA-3319): the agent's
+   * own session on this Mac. Only this reference is kept; the earlier
+   * messages are read again from the agent's own store when the task opens,
+   * and nothing is posted to a Space thread, so the chat stays private to
+   * this device's user. The first message the person sends resumes it.
+   */
+  imported?: ImportedChat;
+}
+
+/** Which of the agent's own chats a task continues. */
+export interface ImportedChat {
+  /** The agent's session id. */
+  sessionId: string;
+  title: string;
+  /** The chat's folder: the run continues there. */
+  cwd: string | null;
+  lastActiveMs: number;
 }
 
 const KEY = "cua.askFirst.tasks";
@@ -121,6 +139,31 @@ export function addAskTask(t: Pick<AskTask, "prompt" | "agent" | "os"> & Partial
 
 export function updateAskTask(id: string, patch: Partial<AskTask> | ((t: AskTask) => Partial<AskTask>)): void {
   save(load().map((t) => (t.id === id ? { ...t, ...(typeof patch === "function" ? patch(t) : patch) } : t)));
+}
+
+/**
+ * A new Home task for one of the agent's own chats (Continue in Cua). Nothing
+ * runs: the task waits for the person's next message. Picking the same chat
+ * again opens the task already made for it.
+ */
+export function addImportedTask(chat: { agent: string; id: string; title: string; cwd: string | null; lastActiveMs: number }, now = Date.now()): AskTask {
+  const existing = load().find((t) => t.imported?.sessionId === chat.id && t.agent === chat.agent && !t.runId);
+  if (existing) return existing;
+  return addAskTask(
+    {
+      prompt: "",
+      agent: chat.agent,
+      os: "macos",
+      onHost: true,
+      imported: { sessionId: chat.id, title: chat.title, cwd: chat.cwd, lastActiveMs: chat.lastActiveMs },
+    },
+    now,
+  );
+}
+
+/** A task's title: what was asked, or the continued chat's own title. */
+export function askTaskTitle(t: Pick<AskTask, "prompt" | "imported">): string {
+  return t.prompt.trim() ? taskTitle(t.prompt) : (t.imported?.title ?? "");
 }
 
 /** Keeps the conversation with the task before its computer goes. */
@@ -320,7 +363,7 @@ export function startErrorView(raw: string, agent: string): StartErrorView {
     };
   // A task from before this Mac was turned into its own Space id: trying again now works.
   if (e.includes(`"${THIS_MAC_ID}"`))
-    return { title: "Couldn't start on this Mac", body: "Try again to start it on this Mac, or pick another computer.", action: "retry", retry: true };
+    return { title: "Couldn't start on this Mac", body: "Try again to start it on this Mac, or pick another machine.", action: "retry", retry: true };
   if (/cloud has ended/.test(e))
     return { title: "That computer is no longer available", body: "Cua Cloud has ended. Pick a computer on this Mac instead.", action: "change-computer", retry: false };
   if (/more than one|ambiguous/.test(e))
@@ -333,7 +376,7 @@ export function startErrorView(raw: string, agent: string): StartErrorView {
     return { title: "Couldn't reach that computer", body: "Check it's on, then try again. Or pick another one.", action: "retry", retry: true };
   if (/disk|space left|no room|memory|quota|limit/.test(e))
     return { title: "This Mac doesn't have room for a new computer", body: "Free some disk space or turn off a computer you're not using, then try again.", action: "retry", retry: true };
-  return { title: `${agent} couldn't start`, body: "Something went wrong. Try again, or pick another computer.", action: "retry", retry: true };
+  return { title: `${agent} couldn't start`, body: "Something went wrong. Try again, or pick another machine.", action: "retry", retry: true };
 }
 
 /** Where a task stands, in the words Home and the thread use. */
@@ -380,7 +423,7 @@ export const SUGGESTIONS: { title: string; detail: string; os: SpaceOs; prompt: 
     title: "Run my project's tests on a clean Linux computer",
     detail: "Find out if it works on a computer that has never seen your code.",
     os: "linux",
-    prompt: "Copy my project onto this computer, install what it needs and run its tests. Tell me what passed and what failed: ",
+    prompt: "Copy my project onto this machine, install what it needs and run its tests. Tell me what passed and what failed: ",
   },
   {
     title: "Try a pull request before merging",

@@ -33,9 +33,12 @@ import type { MachineAccessNotice } from "./contracts/devices";
 import type { MachinePageRow, MachinesView, RuntimesInput } from "./contracts/host";
 import { AGENT_DETAIL_WEBKIT_METHODS } from "./ops/agent-detail";
 import { AGENT_KEYS_WEBKIT_METHODS } from "./ops/agent-keys";
+import { GITHUB_WEBKIT_METHODS } from "./ops/github";
+import { CI_WEBKIT_METHODS } from "./ops/ci";
 import { KEYVAULT_MANAGE_WEBKIT_METHODS } from "./ops/keyvault-manage";
 import { KEYVAULT_SETUP_WEBKIT_METHODS } from "./ops/keyvault-setup";
 import { THREAD_WEBKIT_METHODS } from "./ops/thread";
+import { AGENT_THREADS_WEBKIT_METHODS } from "./ops/agent-threads";
 
 export const WEBKIT_HANDLER_NAME = "cua";
 /** The window event the host dispatches. */
@@ -53,6 +56,7 @@ export const WEBKIT_METHODS = [
   "session.signOut",
   "onboarding.get",
   "onboarding.complete",
+  "onboarding.reset",
   "spaces.list",
   "spaces.open",
   "spaces.createOptions",
@@ -62,6 +66,11 @@ export const WEBKIT_METHODS = [
   "spaces.deleteMany",
   "spaces.leave",
   "spaces.rename",
+  "network.get",
+  "network.set",
+  "network.log",
+  "network.ackNotice",
+  "spaces.setAccess",
   "spaces.cancelCreate",
   "machines.list",
   "host.status",
@@ -82,6 +91,7 @@ export const WEBKIT_METHODS = [
   "agents.signInWait",
   ...AGENT_DETAIL_WEBKIT_METHODS,
   ...AGENT_KEYS_WEBKIT_METHODS,
+  ...GITHUB_WEBKIT_METHODS,
   ...KEYVAULT_SETUP_WEBKIT_METHODS,
   ...KEYVAULT_MANAGE_WEBKIT_METHODS,
   // The pages beyond Spaces, the Keyvault and Agents (ops/webkit-pages.ts).
@@ -100,6 +110,7 @@ export const WEBKIT_METHODS = [
   "teleport.plan",
   "teleport.run",
   "teleport.sites",
+  "teleport.readiness",
   "teleport.remembered",
   "teleport.streamWindow",
   "sharing.list",
@@ -128,6 +139,9 @@ export const WEBKIT_METHODS = [
   "loginItem.openSettings",
   "runtimes.check",
   "runtimes.browse",
+  "repoCache.get",
+  "repoCache.set",
+  "repoCache.clear",
   "devices.get",
   "devices.enroll",
   "devices.checkEnrolled",
@@ -158,6 +172,7 @@ export const WEBKIT_METHODS = [
   "host.setUp",
   "host.joinWithCode",
   "host.action",
+  "host.limits",
   "host.openSettings",
   "settings.get",
   "settings.choose",
@@ -187,9 +202,16 @@ export const WEBKIT_METHODS = [
   "links.list",
   "links.create",
   "links.stop",
+  "links.approve",
+  "links.deny",
+  "shares.settings.get",
+  "shares.settings.set",
+  "shares.edge.remove",
   "cli.plan",
   "cli.install",
+  ...CI_WEBKIT_METHODS,
   ...THREAD_WEBKIT_METHODS,
+  ...AGENT_THREADS_WEBKIT_METHODS,
 ] as const;
 
 export type WebkitMethod = (typeof WEBKIT_METHODS)[number];
@@ -376,6 +398,8 @@ export interface WkSettings {
   cli?: { name: string; installed: boolean } | null;
   /** `AppSettings.tips`; absent: an older host that keeps none. Saved with `settings.update`. */
   tips?: { off: boolean; done: string[] };
+  /** `AppSettings.notchPinned`: the Spaces and desktops pinned to the notch, in pin order; absent: an older host. Saved with `settings.update`. */
+  notchPinned?: string[];
   /** Settings, Advanced's runtimes as the host read them (`runtimes::RuntimesInput`); absent: not read. */
   runtimes?: RuntimesInput | null;
 }
@@ -411,6 +435,13 @@ export interface WkHostState {
   provideSpaces: boolean;
   maxSpaces: number;
   maxMacosVms?: number | null;
+  maxMemoryGb?: number | null;
+  maxDiskGb?: number | null;
+  maxRunMinutes?: number | null;
+  usedMemoryGb?: number | null;
+  usedDiskGb?: number | null;
+  totalMemoryGb?: number | null;
+  totalDiskGb?: number | null;
   recentAccess?: { atMs: number; via: string; who: string; what: string }[] | null;
   accessLogError?: string | null;
   providedSpaces?: import("./contracts/host").HostProvidedSpace[] | null;

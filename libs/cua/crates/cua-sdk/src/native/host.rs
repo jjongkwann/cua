@@ -375,6 +375,15 @@ pub struct HostSettingsChange {
     /// macOS VMs at once (0 to 2, Apple's license).
     #[uniffi(default = None)]
     pub max_macos_vms: Option<u32>,
+    /// Memory the provided Spaces may use in total, in GB (0: no limit).
+    #[uniffi(default = None)]
+    pub max_memory_gb: Option<u32>,
+    /// Disk the provided Spaces may use in total, in GB (0: no limit).
+    #[uniffi(default = None)]
+    pub max_disk_gb: Option<u32>,
+    /// How long a provided Space may run, in minutes (0: no limit).
+    #[uniffi(default = None)]
+    pub max_run_minutes: Option<u32>,
 }
 
 /// A Space this machine provides to one of your devices.
@@ -481,6 +490,25 @@ pub struct HostStatus {
     /// macOS VMs at once (at most two).
     #[uniffi(default = 0)]
     pub max_macos_vms: u32,
+    /// Memory the provided Spaces may use in total, in GB (0: no limit).
+    #[uniffi(default = 0)]
+    pub max_memory_gb: u32,
+    /// Disk the provided Spaces may use in total, in GB (0: no limit).
+    #[uniffi(default = 0)]
+    pub max_disk_gb: u32,
+    /// How long a provided Space may run, in minutes (0: no limit).
+    #[uniffi(default = 0)]
+    pub max_run_minutes: u32,
+    /// What the provided Spaces were given now, in GB.
+    #[uniffi(default = 0)]
+    pub used_memory_gb: u32,
+    #[uniffi(default = 0)]
+    pub used_disk_gb: u32,
+    /// This machine's own memory and disk, in GB (0: not known).
+    #[uniffi(default = 0)]
+    pub total_memory_gb: u32,
+    #[uniffi(default = 0)]
+    pub total_disk_gb: u32,
     /// The Spaces this machine provides now.
     #[uniffi(default = [])]
     pub provided_spaces: Vec<HostProvidedSpace>,
@@ -578,6 +606,13 @@ impl From<cua_host::HostStatus> for HostStatus {
             provide_spaces: s.provide_spaces,
             max_spaces: s.max_spaces,
             max_macos_vms: s.max_macos_vms,
+            max_memory_gb: s.max_memory_gb,
+            max_disk_gb: s.max_disk_gb,
+            max_run_minutes: s.max_run_minutes,
+            used_memory_gb: s.used_memory_gb,
+            used_disk_gb: s.used_disk_gb,
+            total_memory_gb: s.total_memory_gb,
+            total_disk_gb: s.total_disk_gb,
             provided_spaces: s
                 .provided_spaces
                 .into_iter()
@@ -791,6 +826,9 @@ impl Host {
                     provide_spaces: change.provide_spaces,
                     max_spaces: change.max_spaces,
                     max_macos_vms: change.max_macos_vms,
+                    max_memory_gb: change.max_memory_gb,
+                    max_disk_gb: change.max_disk_gb,
+                    max_run_minutes: change.max_run_minutes,
                     cua_bin: None,
                 })
                 .await?
@@ -867,7 +905,28 @@ impl Host {
     pub async fn remove(&self) -> Result<()> {
         let home = self.home.clone();
         run(async move {
-            cua_host::Host::new(home).remove().await?;
+            let host = cua_host::Host::new(home);
+            // The relay is told with this computer's own token; when that is
+            // refused (or it has none) as the signed-in owner, so a
+            // computer that cannot prove itself is still taken off the
+            // account, and one the relay could not be reached for is
+            // retried later.
+            let tokens = SessionTokens(Arc::new(cua_auth::Session::from_env()));
+            let device_session = match host.config()?.and_then(|c| c.relay_url) {
+                Some(url) => tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    own_device_session(&url),
+                )
+                .await
+                .ok()
+                .flatten(),
+                None => None,
+            };
+            host.remove_with_account(&cua_host::RemovalAccount {
+                tokens: &tokens,
+                device_session,
+            })
+            .await?;
             // Then the runtimes cua set up itself (the built-in Lume and the
             // built-in Linux runtime, set up again on the next create that
             // needs them); the user's own stay.
@@ -1252,7 +1311,14 @@ impl Devices {
                 )
                 .await?
                 .into();
-            cua_host::Host::new(cua_daemon::cua_home()).adopt_name(&machine_id, &name)?;
+            // Every copy of the name on this device (this computer's host
+            // setup, the saved directory, the registry), by the machine id.
+            cua_spaces::relay::adopt_machine_name(
+                &cua_daemon::cua_home(),
+                auth.relay_url(),
+                &machine_id,
+                &name,
+            );
             Ok(m)
         })
         .await

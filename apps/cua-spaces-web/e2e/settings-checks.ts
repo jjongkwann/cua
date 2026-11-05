@@ -14,7 +14,7 @@ import { expect, type Locator, type Page } from "@playwright/test";
 import type { ParityCheckpoint } from "../src/bridge/parity";
 import type { SettingsCheckpoint } from "../src/bridge/parity-settings";
 import type { SettingsRow } from "../src/bridge/contracts/host";
-import { LAUNCH_HELP, LAUNCH_LABEL, lastChecked, plainDevice, plainDeviceSentence, plainStorage } from "../src/lib/settings-copy";
+import { LAUNCH_HELP, LAUNCH_LABEL, lastChecked, plainStorage } from "../src/lib/settings-copy";
 import { checkAgentKeys } from "./agent-keys";
 
 type Of<K extends SettingsCheckpoint["kind"]> = Extract<SettingsCheckpoint, { kind: K }>;
@@ -116,7 +116,7 @@ async function checkAbout(page: Page, checkpoints: ParityCheckpoint[]): Promise<
   return states.length;
 }
 
-/* ---- Devices --------------------------------------------------------------- */
+/* ---- Machines: this machine's trust, the machines waiting, the enroll sheet ---------- */
 
 async function checkDevices(page: Page, checkpoints: ParityCheckpoint[]): Promise<number> {
   let checked = 0;
@@ -126,30 +126,25 @@ async function checkDevices(page: Page, checkpoints: ParityCheckpoint[]): Promis
       last = cp;
       const { input, now, view: v } = cp;
       await page.evaluate(([i, n]) => window.__cuaParity!.settings.showDevices(i, n), [input, now] as const);
-      const step = `Devices: ${v.thisDevice.title}`;
-      if (v.banner) await expect(page.locator("[data-banner-text]"), step).toHaveText(plainDeviceSentence(v.banner.text));
-      else await expect(page.locator("[data-devices-banner]"), step).toHaveCount(0);
-      await expect(page.locator("[data-this-device-status]"), step).toHaveAttribute("data-this-device-status", v.thisDevice.kind);
-      await expect(page.locator("[data-this-device-status]"), step).toContainText(plainDevice(v.thisDevice.title));
-      await expect(page.locator("[data-this-device-enroll]"), step).toHaveCount(v.thisDevice.actionLabel ? 1 : 0);
-      await expect.poll(() => attrs(page.locator("[data-device-row]"), "data-device-row"), { message: step }).toEqual(v.rows.map((r) => r.id));
-      expect(await texts(page.locator("[data-device-title]")), step).toEqual(v.rows.map((r) => r.title));
-      const details = await texts(page.locator("[data-device-detail]"));
-      v.rows.forEach((r, i) => expect(details[i], `${step}: ${r.id}`).toContain(plainDevice(r.detail)));
-      for (const r of v.rows) {
-        const row = page.locator(`[data-device-row="${r.id}"]`);
-        await expect(row.locator("[data-device-approve]"), `${step}: ${r.id} Approve`).toHaveCount(r.actions.includes("approve") ? 1 : 0);
-        await expect(row.locator("[data-device-menu]"), `${step}: ${r.id} menu`).toHaveCount(r.actions.some((a) => a === "rename" || a === "revoke") ? 1 : 0);
-      }
-      expect(await texts(page.locator("[data-recent-text]")), step).toEqual(v.recent.map((a) => plainDeviceSentence(a.text)));
-      expect(await attrs(page.locator("[data-unconfirmed-machine]"), "data-unconfirmed-machine"), step).toEqual(v.unconfirmedMachines.map((m) => m.id));
+      const step = `Machines: ${v.thisDevice.title}`;
+      // This machine's page says what the core says under Details: its trust, and what to do about it.
+      const toggle = page.locator("[data-machine-details-toggle]");
+      if ((await toggle.getAttribute("aria-expanded")) !== "true") await toggle.click();
+      await expect(page.locator("[data-machine-trust]"), step).toHaveAttribute("data-machine-trust", v.thisDevice.kind);
+      await expect(page.locator("[data-machine-trust-status]"), step).toContainText(v.thisDevice.title);
+      await expect(page.locator("[data-machine-trust-action]"), step).toHaveCount(v.thisDevice.actionLabel ? 1 : 0);
+      if (v.banner) await expect(page.locator("[data-machine-trust-text]"), step).toHaveText(v.banner.text);
+      else await expect(page.locator("[data-machine-trust-text]"), step).toHaveCount(0);
+      // The machines waiting to be added are the top group.
+      const waiting = [...v.unconfirmedMachines.map((m) => m.id), ...v.approvals.map((a) => a.deviceId)];
+      await expect.poll(() => attrs(page.locator("[data-pending-machine]"), "data-pending-machine"), { message: step }).toEqual(waiting);
       checked++;
     } else if (cp.kind === "enroll" && last) {
       const { state, view: v } = cp;
       await page.evaluate(([i, n, s]) => window.__cuaParity!.settings.showDevices(i, n, { enroll: s }), [last.input, last.now, state] as const);
       const sheet = page.locator("[data-enroll]");
       const step = `Enroll sheet, ${state.phase}`;
-      await expect(sheet.locator("[data-enroll-title]"), step).toHaveText(plainDeviceSentence(v.title));
+      await expect(sheet.locator("[data-enroll-title]"), step).toHaveText(v.title);
       expect(await attrs(sheet.locator("[data-enroll-option]"), "data-enroll-option"), step).toEqual(v.options.map((o) => o.method));
       await expect(sheet.locator("[data-enroll-code]"), step).toHaveCount(v.code ? 1 : 0);
       if (v.code) await expect(sheet.locator("[data-enroll-code]"), step).toHaveText(v.code);
@@ -159,22 +154,6 @@ async function checkDevices(page: Page, checkpoints: ParityCheckpoint[]): Promis
       else await expect(sheet.locator("[data-enroll-error]"), step).toHaveCount(0);
       await expect(sheet.locator("[data-enroll-back]"), step).toHaveCount(v.backLabel ? 1 : 0);
       await expect(sheet.locator("[data-enroll-close]"), step).toHaveText(v.closeLabel);
-      checked++;
-    } else if (cp.kind === "approve" && last) {
-      const { state, view: v } = cp;
-      await page.evaluate(([i, n, s]) => window.__cuaParity!.settings.showDevices(i, n, { approve: s }), [last.input, last.now, state] as const);
-      const sheet = page.locator("[data-approve]");
-      const step = `Approval sheet for ${state.name}, code "${state.code}"${state.busy ? ", busy" : ""}`;
-      await expect(sheet.locator("[data-approve-title]"), step).toHaveText(plainDeviceSentence(v.title));
-      await expect(sheet.locator("[data-approve-message]"), step).toHaveText(plainDeviceSentence(v.message));
-      await expect(sheet.locator("[data-approve-code]"), step).toHaveCount(v.needsCode ? 1 : 0);
-      if (v.needsCode) await expect(sheet.locator("[data-approve-code]"), step).toHaveValue(v.code);
-      if (v.error) await expect(sheet.locator("[data-approve-error]"), step).toHaveText(v.error);
-      else await expect(sheet.locator("[data-approve-error]"), step).toHaveCount(0);
-      await expect(sheet.locator("[data-approve-submit]"), step).toHaveText(v.approveLabel);
-      if (v.canApprove) await expect(sheet.locator("[data-approve-submit]"), step).toBeEnabled();
-      else await expect(sheet.locator("[data-approve-submit]"), step).toBeDisabled();
-      await expect(sheet.locator("[data-approve-deny]"), step).toHaveText(v.denyLabel);
       checked++;
     }
   }
@@ -210,9 +189,16 @@ async function checkStorage(page: Page, checkpoints: ParityCheckpoint[]): Promis
 
 /* ---- Experiments ------------------------------------------------------------ */
 
-/** Advanced keeps Labs: Cua Volume. Sharing, Your cloud and the New UI have no switch. */
+/** Advanced keeps Labs: a switch for every experiment, on or off. Sharing, Your cloud and the New UI have no switch. */
 const LABS: Record<string, { label?: string; note: string }> = {
   "experiment:cua_volume": { note: "Memory and files your agents share across every Space." },
+  "experiment:secure_spaces": { note: "A Space reaches the internet and nothing else on your network unless you open it." },
+  "experiment:child_spaces": { note: "A Space can make Spaces of its own, inside a budget you set." },
+  "experiment:ask_first": { note: "An agent asks you on a card before anything leaves its Space, such as a push to GitHub." },
+  "experiment:ci_runners": { note: "Run GitHub Actions jobs in a fresh Space each, on this computer. Adds CI Runners to the sidebar." },
+  "experiment:tcp_shares": { note: "Share a game server or another TCP service in a Space at a public address." },
+  "experiment:mobile": { note: "Your computers answer the Cua Spaces phone app: start a task, follow the thread and review changes." },
+  "experiment:warm_pools": { note: "Keep one Linux Space ready on this computer, with its coding apps installed, so the next Create from Home starts at once." },
 };
 
 async function checkExperiments(page: Page, checkpoints: ParityCheckpoint[]): Promise<number> {

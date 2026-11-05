@@ -19,6 +19,7 @@ import { createProgress, spaceState } from "@/lib/spaces";
 import { cn } from "@/lib/utils";
 
 import { agentName, AppMark, TASK_AGENTS, WherePicker } from "./ask-box";
+import { ImportedTaskView } from "./imported-task";
 import { StateDot, taskRun } from "./home";
 import { useWherePick } from "./this-mac-confirm";
 import { useStartTask } from "./use-start-task";
@@ -48,6 +49,8 @@ export function AskFirstTask({ taskId }: { taskId: string }) {
       </div>
     );
   }
+  // A chat picked from "Pick up where you left off" (CUA-3319): its earlier messages and the box to continue it.
+  if (task.imported) return <ImportedTaskView task={{ ...task, imported: task.imported }} />;
   return <TaskView task={task} />;
 }
 
@@ -288,7 +291,7 @@ export function StartFailed({ error, name, agent, host, onRetry }: { error: stri
   const view = startErrorView(error, name);
   const { core } = useBridge();
   const connectors = useConnectors();
-  // "Connect <app>" in place of Add your key: Settings, Connectors' Connect, here; then it starts again by itself.
+  // "Connect <app>" in place of Add your key: Settings, Connections' Connect, here; then it starts again by itself.
   const setupId = TASK_AGENTS.find((a) => a.id === agent)?.setupId ?? agent ?? "";
   const card = view.action === "add-key" ? setupCard(core, connectors.input, setupId, name) : null;
   const [connecting, setConnecting] = useState(false);

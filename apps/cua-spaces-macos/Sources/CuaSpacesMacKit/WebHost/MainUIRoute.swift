@@ -35,6 +35,10 @@ public enum MainUIRoute: Equatable, Sendable {
     /// launch. The page keeps that choice, `due` asks it to honour it.
     static let firstRunDue = MainUIRoute.path("/onboarding?due=1")
 
+    /// The first run at the app's first launch here: the page forgets what
+    /// it kept from an earlier install (a "Skip for now", half-done steps).
+    static let firstLaunch = MainUIRoute.path("/onboarding?fresh=1")
+
     /// The page's path, query included.
     var webPath: String {
         switch self {
@@ -93,7 +97,9 @@ struct MainUIRouter {
     /// The main window as the person left it, or the first run while it is
     /// due (`launchRoute`): the Dock icon, Open, ⌘⇧Space, the notch's list.
     func openMain() {
-        if let route = Self.launchRoute(onboarded: model.onboarding.completed) {
+        if let route = Self.launchRoute(onboarded: model.onboarding.completed,
+                                        firstLaunch: model.onboarding.firstLaunch) {
+            model.onboarding.markSeen()
             web(route)
         } else if WebUIWindowController.shared != nil {
             // Open already: in front, on the page it shows.
@@ -105,17 +111,20 @@ struct MainUIRouter {
 
     /// Where a window opens while the first run may be due: its page until it
     /// is done (`.firstRunDue`, which keeps a "Skip for now"), else nil (the
-    /// page the window shows, or Spaces).
-    static func launchRoute(onboarded: Bool) -> MainUIRoute? {
-        onboarded ? nil : .firstRunDue
+    /// page the window shows, or Spaces). The app's first launch here always
+    /// shows it (`.firstLaunch`): a "Skip for now" the page kept from an
+    /// earlier install must not hide it from a new user (CUA-3063).
+    static func launchRoute(onboarded: Bool, firstLaunch: Bool = false) -> MainUIRoute? {
+        if onboarded { return nil }
+        return firstLaunch ? .firstLaunch : .firstRunDue
     }
 
     /// The page a click on one of the app's notifications opens: a Space that
-    /// came up (its page), a device asking to join (Settings, Devices, with
-    /// its approval), an agent's answer or request (Agents), else Spaces.
+    /// came up (its page), a machine asking to be added (Machines, where
+    /// it waits with Add machine and Not me), an agent's answer or request (Agents), else Spaces.
     static func route(forNotification id: String) -> MainUIRoute {
         if let spaceId = SpaceReadyNote.spaceId(fromIdentifier: id) { return .space(spaceId) }
-        if id.hasPrefix("device-") { return .path("/settings/devices") }
+        if id.hasPrefix("device-") { return .path("/machines") }
         if id.hasPrefix("agent-") { return .agents }
         return .home
     }

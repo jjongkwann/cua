@@ -62,7 +62,7 @@
 #               every logon (Windows-native equivalent of macOS LaunchAgent).
 #               The task runs with LogonType=Interactive so it lands in
 #               Session 1+ with an attached desktop — required for the
-#               GUI tools (click, type_text, screenshot, get_window_state)
+#               GUI tools (click, type_text, get_window_state, get_desktop_state)
 #               to function. Default off; the post-install message prints
 #               the registration command so you can opt in later. Safe to
 #               re-run: existing task is replaced.
@@ -149,7 +149,7 @@ $ThemeBinaryName = "cua-cursor-theme.exe"
 # where the baked line hasn't been updated yet.
 #
 # ~~~ BAKED_VERSION: auto-updated after release publication — do not edit ~~~
-$Script:CuaDriverRsBakedVersion = "0.37.0" # published-installer-version
+$Script:CuaDriverRsBakedVersion = "0.38.0" # published-installer-version
 # ~~~ END_BAKED_VERSION ~~~
 #
 # Withdrawn releases (for example, a release published without valid

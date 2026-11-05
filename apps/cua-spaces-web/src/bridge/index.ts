@@ -54,20 +54,36 @@ export type {
 } from "./store";
 export { newPendingId } from "./store";
 export type { TranscriptItem, TranscriptStep } from "./transcript";
-export { GRID_COLUMNS, iconKey, thumbnailKey, useTeleport, type TeleportHook, type TeleportSession, type TeleportStore } from "./teleport";
+export { authorView, exportCardView } from "./thread-cards";
+export type { AuthorView, CardCommitRow, CardFileRow, ExportCardView, Square } from "./thread-cards";
+export {
+  AUTOMATION_PANE,
+  FULL_DISK_ACCESS_PANE,
+  GRID_COLUMNS,
+  iconKey,
+  setupBlocked,
+  setupProfile,
+  thumbnailKey,
+  useTeleport,
+  type TeleportHook,
+  type TeleportSession,
+  type TeleportSetup,
+  type TeleportStore,
+} from "./teleport";
 export { useShareSheet, type ShareHook, type ShareSession } from "./share";
 export { useShareRemovalNote, type ShareRemovalNoteHook } from "./removal-note";
 export {
   agentKeyForm,
   agentKeysView,
   useAgentKeys,
+  useKeysRecheck,
   type AgentKeyFormView,
   type AgentKeyRowView,
   type AgentKeysHook,
   type AgentKeysInput,
   type AgentKeysView,
 } from "./agent-keys";
-export type { AgentKeyInfo, AgentKeyProvider, AgentKeysReport } from "./ops/agent-keys";
+export type { AgentKeyInfo, AgentKeyProvider, AgentKeysReport, KeyChoices } from "./ops/agent-keys";
 export { connectionRows, useConnections, type ConnectionsHook, type ConnectionReport, type ConnectionRow, type ConnectionRowView, type ConnectResult } from "./connections";
 export {
   DEFAULT_SETTINGS,
@@ -103,6 +119,7 @@ export { signInFailedFromError, signInFailedPhase, signInFooter, type FailedPhas
 export {
   useCloudActions,
   useConnectCloud,
+  useFirstPrompts,
   useFirstSpaceOffers,
   useNewSpaceRequests,
   useNewSpaceWizard,
@@ -114,9 +131,16 @@ export {
   type RuntimeFixHook,
 } from "./new-space-hooks";
 export { runCreateFix, type CreateFixActions } from "./create-retry";
-export { createFailedText, emptyHome, type EmptyHome, type EmptyTile, type FirstSpaceOffer } from "./new-space";
+export { createFailedText, emptyHome, type EmptyHome, type EmptyTile, type FirstPrompts, type FirstSpaceOffer, type PromptCap, type PromptExample, type PromptSuggestion } from "./new-space";
 export type * from "./contracts/volume";
 export * from "./volume";
+export type { GithubAccountRow, GithubDetail, GithubRow, GithubSourceLine, GithubTone, GithubView } from "./contracts/github";
+export { githubView, useGithub, type GithubHook } from "./github";
+export type { GithubReport, GithubHost, GithubAccount, GithubSource } from "./ops/github";
+export type * from "./contracts/ci-runners";
+export * from "./ci-runners";
+export type * from "./contracts/prepare";
+export * from "./prepare-core";
 export { ThumbnailStore, THUMBNAIL_CAP, THUMBNAIL_REFRESH_MS, thumbnailStore, useSpaceThumbnail } from "./thumbnails";
 export { useWindowDropTarget } from "./window-drop";
 export { useSpaceFiles, parseDropped, dropSendingText, dropSentText, sendFiles, splitDrop, type DropStatus, type SpaceFilesHook } from "./space-files";
@@ -134,6 +158,7 @@ export { displayPairingCode, normalizePairingCode, pairingLinkRelay } from "./pa
 export { BUY_PRO_URL, BUY_TEAMS_URL, expiresInText, FINISHING_SETUP, PAIRING_POLL_MS, pairingUnsupported, planFailure, usePairingCode, type PairingHook, type PairingPhase } from "./pairing";
 export { READY_STARTUP, type StartupAction, type StartupPhase, type StartupState } from "./ops/startup";
 export { NO_TIPS, sendTipsEvent, tipsState, useTips, type TipsHook } from "./tips";
+export { useNotchPins, type NotchPins } from "./notch-pins";
 export {
   CHECKLIST_STEPS,
   useChecklist,
@@ -156,9 +181,9 @@ export {
   type RelayUsageView,
 } from "./relay-usage";
 
-export { linkEnds, needsRelaySetup, useLinks, type LinksHook } from "./links";
+export { dataWords, linkEnds, needsRelaySetup, useLinks, useShareSettings, type LinksHook, type ShareSettingsHook } from "./links";
 export { chatKey, mergeChats, useAgentChats, useAgentDm, type AgentChat, type AgentChats, type AgentChatSpace, type AgentDm, type ChatAttempt, type ChatNeed, type ChatTone, type DmItem } from "./agents-dm";
-export { foldThread, readSeqFrom, useSpaceThread, type SpaceThread, type SpaceThreadStatus, type ThreadAnswer, type ThreadItem } from "./thread";
+export { foldThread, readSeqFrom, useSpaceThread, type SpaceThread, type SpaceThreadStatus, type ThreadAnswer, type ThreadItem, type ThreadQuote } from "./thread";
 export {
   DEFAULT_AGENT_RIGHTS,
   isMissingThreadTool,
@@ -186,7 +211,8 @@ export {
   type ThreadPage,
   type ThreadRole,
 } from "./ops/thread";
-export type { LinkAccess, LinkCreate, ShareLink } from "./ops/links";
+export { folderLabel, resumeContext, THREAD_AGENTS, type PastMessage, type PastThread, type RecentThread, type ThreadAgent } from "./ops/agent-threads";
+export type { LinkAccess, LinkCreate, ShareLanding, ShareLink, ShareSettings } from "./ops/links";
 export {
   useResources,
   hostResources,
@@ -222,7 +248,7 @@ export {
   type UpsellPrompt,
   type UpsellSurface,
 } from "./upsell";
-export { flagOn, setFlagOverride, setRemoteFlags, useFlag, type FlagName } from "./flags";
+export { flagOn, newOnboardingOn, setFlagOverride, setRemoteFlags, useFlag, useNewOnboarding, type FlagName } from "./flags";
 export type { CreateReport, ReportPart, ReportSend } from "./diagnostic-report";
 export {
   FIRST_RUN_POLL_MS,

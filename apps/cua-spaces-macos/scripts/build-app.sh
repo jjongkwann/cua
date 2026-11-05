@@ -86,6 +86,8 @@ fi
 icons="$here/../cua-spaces/src-tauri/icons"
 # CUA_VZ_BIN, CUA_MICROVM_INIT_BIN: the microVM monitor (cua-vz) and the
 # static aarch64 guest init to bundle (build-release.sh builds both).
+# CUA_NETGW_BIN: the microVMs' network gateway (cua-netgw) to bundle
+# (libs/cua/netgw/build.sh).
 # CUA_SPACESD_STATIC_DIR: a directory of static Linux cua-spacesd builds
 # (cua-spacesd-linux-aarch64, cua-spacesd-linux-x86_64) to bundle: the
 # daemon injects one into OCI images that carry none (the release workflow
@@ -224,6 +226,20 @@ mkdir -p "$app/Contents/Library/LaunchAgents" "$app/Contents/Helpers"
 spacesd="$("$here/scripts/fetch-spacesd.sh" ${archs:-$(uname -m)})"
 cp "$spacesd" "$app/Contents/Helpers/cua-spacesd"
 chmod 0755 "$app/Contents/Helpers/cua-spacesd"
+# Cua Driver, the computer-use server coding agents on this Mac use: the
+# release pinned in cua-driver.release.json (scripts/fetch-cua-driver.sh
+# checks its size, SHA-256 and Developer ID signature), next to the host
+# service. cua-spacesd runs it as its own child, so macOS counts its
+# Accessibility and Screen Recording as Cua Spaces'. In Contents/Helpers for
+# the same reason as cua-spacesd: its cursor overlay starts AppKit. The
+# release keeps its own signature here (it is not stripped or re-signed);
+# build-release.sh signs it with the release identity.
+# shellcheck disable=SC2086 # one word per architecture
+driver_dir="$("$here/scripts/fetch-cua-driver.sh" ${archs:-$(uname -m)})"
+for f in cua-driver cua-cursor-theme; do
+  cp "$driver_dir/$f" "$app/Contents/Helpers/$f"
+  chmod 0755 "$app/Contents/Helpers/$f"
+done
 helper_plist="$app/Contents/Library/LaunchAgents/$helper_label.plist"
 cp "$here/Support/Helper/com.trycua.spaces.helper.plist" "$helper_plist"
 if [ "$channel" = local ]; then
@@ -271,6 +287,11 @@ if [ -n "${CUA_VZ_BIN:-}" ] && [ -n "${CUA_MICROVM_INIT_BIN:-}" ]; then
     "$app/Contents/MacOS/cua-vz"
   cp "$CUA_MICROVM_INIT_BIN" "$app/Contents/Resources/cua-microvm-init"
 fi
+# The network gateway among the executables (found next to `cua`).
+if [ -n "${CUA_NETGW_BIN:-}" ]; then
+  cp "$CUA_NETGW_BIN" "$app/Contents/MacOS/cua-netgw"
+  codesign -s - -f -i ai.cua.netgw "$app/Contents/MacOS/cua-netgw"
+fi
 # The static cua-spacesd builds among the resources (Linux executables, data
 # to the bundle).
 if [ -n "${CUA_SPACESD_STATIC_DIR:-}" ]; then
@@ -310,7 +331,8 @@ fi
 # only fail on the other kind of Mac).
 if [ -n "$archs" ]; then
   for f in "$app/Contents/MacOS/CuaSpacesMac" "$app/Contents/Frameworks/libcua_sdk.dylib" "$app/Contents/MacOS/cua" \
-    "$app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" "$app/Contents/Helpers/cua-spacesd"; do
+    "$app/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" "$app/Contents/Helpers/cua-spacesd" \
+    "$app/Contents/Helpers/cua-driver" "$app/Contents/Helpers/cua-cursor-theme"; do
     [ -e "$f" ] || continue
     for arch in $archs; do
       lipo "$f" -verify_arch "$arch" || { echo "$f has no $arch slice ($(lipo -archs "$f"))" >&2; exit 1; }

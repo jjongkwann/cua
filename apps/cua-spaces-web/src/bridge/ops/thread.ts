@@ -143,7 +143,7 @@ export interface ThreadEntry {
   task: { to: string; session: number | null } | null;
   attachments: ThreadAttachment[];
   /** An agent asks before it acts. */
-  approval: { action: string; details: string; state: string } | null;
+  approval: { action: string; details: string; state: string; card?: Record<string, unknown> | null } | null;
   /** Someone answered an approval (`kind: "answer"`). */
   answer: { approval: number; approve: boolean; note: string | null } | null;
   /** A system note about a task (`task_seq` on a `system` entry): it shows inside that task. */
@@ -160,6 +160,8 @@ export interface ThreadEntry {
   view?: ThreadView | null;
   /** On an agent's reply to a task that failed: what failed, with the complete text. `text` says it in plain words. */
   failure?: ThreadFailure | null;
+  /** On the copy of a message that tasks one more agent when it names several (`@a @b`, `@everyone`): the entry it copies. The page draws the original only. */
+  fanoutOf?: number | null;
 }
 
 /** `thread_post`'s `view` and every entry's: the Space's desktop, or one of its windows (`cua.env.v1.ThreadView`). */
@@ -179,6 +181,10 @@ export interface LiveAgent {
   agent: string;
   /** In a few plain words: `starting`, `installing`, `thinking`, `replying` or `using Bash`. */
   stage: string;
+  /** When its oldest open task was given (Unix ms): the working row's clock. */
+  sinceMs?: number;
+  /** What it has said so far this turn, the whole text each time, while it streams; the reply replaces it. */
+  text?: string;
 }
 
 /** Every agent with a turn on its way, and a key that changes when any stage does. */
@@ -628,7 +634,15 @@ export function threadEntryFromTool(v: unknown): ThreadEntry | null {
     task: task && str(task.to) ? { to: str(task.to), session: num(task.session) } : null,
     noteFor: kind === "system" ? num(e.task_seq) : null,
     attachments: (Array.isArray(e.attachments) ? e.attachments : []).map(attachment).filter((a): a is ThreadAttachment => a !== null),
-    approval: approval ? { action: str(approval.action), details: str(approval.details), state: str(approval.state, "open") } : null,
+    approval: approval
+      ? {
+          action: str(approval.action),
+          details: str(approval.details),
+          state: str(approval.state, "open"),
+          // A card is data only Cua's own host writes: an agent's approval stays text.
+          card: author(e.author).kind === "system" ? obj(approval.card) : null,
+        }
+      : null,
     answer: answer && num(answer.approval) !== null ? { approval: num(answer.approval)!, approve: answer.approve === true, note: str(answer.note) || null } : null,
     update:
       update && num(update.task) !== null && updateState
@@ -639,6 +653,7 @@ export function threadEntryFromTool(v: unknown): ThreadEntry | null {
     ...(kind === "join_request" ? { joinRequest: joinRequest(e) } : {}),
     ...(e.view != null ? { view: threadViewFromTool(e.view) } : {}),
     ...(e.failure != null ? { failure: threadFailure(e.failure) } : {}),
+    ...(num(e.fanout_of) !== null ? { fanoutOf: num(e.fanout_of) } : {}),
   };
 }
 
@@ -779,7 +794,9 @@ export function threadLiveFromTool(v: unknown): ThreadLive {
     const r = obj(a);
     const agent = str(r?.agent);
     const stage = str(r?.stage);
-    return agent && stage ? [{ agent, stage }] : [];
+    const sinceMs = typeof r?.since_ms === "number" ? r.since_ms : undefined;
+    const text = str(r?.text);
+    return agent && stage ? [{ agent, stage, ...(sinceMs ? { sinceMs } : {}), ...(text ? { text } : {}) }] : [];
   });
   return { key: str(o.key), agents };
 }

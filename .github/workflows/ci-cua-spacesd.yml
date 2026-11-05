@@ -6,6 +6,7 @@ name: "CI: cua-spacesd"
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "libs/cua-spacesd/**"
       - "libs/cua-driver/rust/**"
@@ -87,8 +88,14 @@ env:
   CUA_ENV_TEST_SANDBOX: "1"
 
 jobs:
+  quick:
+    name: quick
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/ci-quick.yml
+
   changes:
-    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
+    needs: quick
+    if: ${{ !failure() && !cancelled() && ((github.event_name != 'pull_request' || !github.event.pull_request.draft) && (!startsWith(github.head_ref, 'release-please--branches--'))) }}
     name: "cua-spacesd / changes"
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -149,7 +156,7 @@ jobs:
   test:
     name: fmt, clippy, test (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.run == 'true' && needs.changes.outputs.legs_test != '[]'
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (needs.changes.outputs.run == 'true' && needs.changes.outputs.legs_test != '[]') }}
     strategy:
       fail-fast: false
       matrix:
@@ -269,9 +276,10 @@ jobs:
     name: Cua Volume mount (Windows NFS client)
     # Not shipped yet (renames fail in the Windows NFS client): run on
     # demand while the Windows mount is finished.
-    if: github.event_name == 'workflow_dispatch'
+    needs: quick
+    if: ${{ !failure() && !cancelled() && ((github.event_name != 'pull_request' || !github.event.pull_request.draft) && (github.event_name == 'workflow_dispatch')) }}
     runs-on: windows-latest
-    timeout-minutes: 75
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -327,9 +335,9 @@ jobs:
   relay-e2e:
     name: relay e2e (docker)
     needs: changes
-    if: needs.changes.outputs.run == 'true' && contains(needs.changes.outputs.matrix, 'ubuntu') && !contains(fromJSON(needs.changes.outputs.reused), 'relay e2e (docker)')
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (needs.changes.outputs.run == 'true' && contains(needs.changes.outputs.matrix, 'ubuntu') && !contains(fromJSON(needs.changes.outputs.reused), 'relay e2e (docker)')) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -352,7 +360,7 @@ jobs:
   # require if branch protection ever needs one.
   result:
     name: "cua-spacesd / result"
-    if: always()
+    if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.draft) && (always()) }}
     needs: [changes, test, relay-e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 5

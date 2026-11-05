@@ -3034,6 +3034,28 @@ export function appNotchTileAt(layout: AppNotchLayout, tiles: Array<AppNotchTile
     }
 
 /**
+ * `pinned` (the notch's pins, in pin order) with `id` pinned or, when it
+ * already is, unpinned: Pin to notch and Unpin from notch.
+ */
+export function appNotchTogglePin(pinned: Array<string>, id: string): Array<string> {
+    return ((__rb: Uint8Array) => {
+        try {
+            return FfiConverterSequenceString.lift(__rb);
+        } finally {
+            nativeModule().rustbuffer_free(__rb);
+        }
+    })(uniffiCaller.rustCall(
+            /*caller:*/ (callStatus) => {
+                return nativeModule().uniffi_cua_spaces_ffi_fn_func_app_notch_toggle_pin(
+        FfiConverterSequenceString.lower(pinned, nativeModule().rustbuffer_alloc),
+        FfiConverterString.lower(id, nativeModule().rustbuffer_alloc),
+                callStatus);
+            },
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+    ));
+    }
+
+/**
  * The notch panel as drawn.
  */
 export function appNotchView(state: AppNotchState, spaces: Array<AppSpace>): AppNotchView {
@@ -4500,7 +4522,9 @@ export function appSettingsInputFromJson(json: string): AppSettingsInput /*throw
     }
 
 /**
- * Reads the settings file (defaults when missing or damaged).
+ * Reads the settings file (defaults when missing or damaged). The
+ * experiments the daemon enforces (Secure Spaces, Child Spaces, Ask first, CI runners, Public TCP shares, Phone app) are what
+ * the cua home keeps, so `cua experiments enable` shows in the app.
  */
 export function appSettingsLoad(path: string): AppSettings {
     return ((__rb: Uint8Array) => {
@@ -4563,7 +4587,8 @@ export function appSettingsResolveNewUi(settings: AppSettings, version: string):
     }
 
 /**
- * Writes the settings file.
+ * Writes the settings file, and keeps the experiments the daemon enforces
+ * where it reads them (the cua home).
  */
 export function appSettingsSave(path: string, settings: AppSettings): void /*throws*/ {uniffiCaller.rustCallWithError(
             /*liftError:*/ FfiConverterTypeCuaError.lift.bind(FfiConverterTypeCuaError),
@@ -8832,7 +8857,20 @@ export type AppAgentKeyInput = {
     /**
      * A sign-in past its expiry: not used by any run until reconnected.
      */
-    expired: boolean
+    expired: boolean,
+    /**
+     * A copied sign-in's name ("Signed in as ada@example.com (Claude Max)").
+     */
+    label?: string,
+    /**
+     * The plan or region chosen for it (Z.AI), when the provider has them.
+     */
+    region?: string,
+    /**
+     * Non-secret values saved with it: a custom endpoint's `base_url`, `model`
+     * and `wire`, or a `model`. Never the key.
+     */
+    fields: Map<string, string>
 }
 
 /**
@@ -8860,7 +8898,10 @@ const FfiConverterTypeAppAgentKeyInput = (() => {
                 env: FfiConverterString.read(from),
                 last4: FfiConverterString.read(from),
                 addedMs: FfiConverterUInt64.read(from),
-                expired: FfiConverterBool.read(from)
+                expired: FfiConverterBool.read(from),
+                label: FfiConverterOptionalString.read(from),
+                region: FfiConverterOptionalString.read(from),
+                fields: FfiConverterMapStringString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -8869,13 +8910,19 @@ const FfiConverterTypeAppAgentKeyInput = (() => {
             FfiConverterString.write(value.last4, into);
             FfiConverterUInt64.write(value.addedMs, into);
             FfiConverterBool.write(value.expired, into);
+            FfiConverterOptionalString.write(value.label, into);
+            FfiConverterOptionalString.write(value.region, into);
+            FfiConverterMapStringString.write(value.fields, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.provider) +
              FfiConverterString.allocationSize(value.env) +
              FfiConverterString.allocationSize(value.last4) +
              FfiConverterUInt64.allocationSize(value.addedMs) +
-             FfiConverterBool.allocationSize(value.expired);
+             FfiConverterBool.allocationSize(value.expired) +
+             FfiConverterOptionalString.allocationSize(value.label) +
+             FfiConverterOptionalString.allocationSize(value.region) +
+             FfiConverterMapStringString.allocationSize(value.fields);
 
         }
     };
@@ -14521,7 +14568,48 @@ export type AppExperiments = {
      * The shared web UI is the main window. Always on in the macOS shell
      * ([`crate::settings::resolve_new_ui`]); kept for older files and builds.
      */
-    webUi: boolean
+    webUi: boolean,
+    /**
+     * Secure Spaces: a Space reaches the internet and nothing else on the
+     * network unless it is opened. Off unless turned on; the daemon enforces
+     * it (the switch is kept in the cua home).
+     */
+    secureSpaces: boolean,
+    /**
+     * Child Spaces: a Space may make Spaces of its own. Off unless turned
+     * on; the daemon enforces it (the switch is kept in the cua home).
+     */
+    childSpaces: boolean,
+    /**
+     * Ask first: an agent asks on a card before something leaves its Space
+     * (a push to GitHub). Off unless turned on; the daemon enforces it (the
+     * switch is kept in the cua home).
+     */
+    askFirst: boolean,
+    /**
+     * CI runners: GitHub Actions jobs run in a fresh Space each (`cua ci`
+     * and the CI Runners page). Off unless turned on; the daemon and the
+     * `cua` command enforce it (the switch is kept in the cua home).
+     */
+    ciRunners: boolean,
+    /**
+     * Public TCP shares: a raw TCP service in a Space (a game server) at a
+     * public address. Off unless turned on; the daemon enforces it (the
+     * switch is kept in the cua home).
+     */
+    tcpShares: boolean,
+    /**
+     * Mobile: the computer answers the Cua Spaces phone app (its tools and
+     * push events). Off unless turned on; the daemon enforces it (the switch
+     * is kept in the cua home).
+     */
+    mobile: boolean,
+    /**
+     * Warm pools: one Linux Space kept ready, with its coding apps
+     * installed, so the next Create from Home starts at once. Off unless
+     * turned on; the daemon enforces it (the switch is kept in the cua home).
+     */
+    warmPools: boolean
 }
 
 /**
@@ -14548,7 +14636,14 @@ const FfiConverterTypeAppExperiments = (() => {
                 cuaVolume: FfiConverterBool.read(from),
                 yourCloud: FfiConverterBool.read(from),
                 sharing: FfiConverterBool.read(from),
-                webUi: FfiConverterBool.read(from)
+                webUi: FfiConverterBool.read(from),
+                secureSpaces: FfiConverterBool.read(from),
+                childSpaces: FfiConverterBool.read(from),
+                askFirst: FfiConverterBool.read(from),
+                ciRunners: FfiConverterBool.read(from),
+                tcpShares: FfiConverterBool.read(from),
+                mobile: FfiConverterBool.read(from),
+                warmPools: FfiConverterBool.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -14556,12 +14651,26 @@ const FfiConverterTypeAppExperiments = (() => {
             FfiConverterBool.write(value.yourCloud, into);
             FfiConverterBool.write(value.sharing, into);
             FfiConverterBool.write(value.webUi, into);
+            FfiConverterBool.write(value.secureSpaces, into);
+            FfiConverterBool.write(value.childSpaces, into);
+            FfiConverterBool.write(value.askFirst, into);
+            FfiConverterBool.write(value.ciRunners, into);
+            FfiConverterBool.write(value.tcpShares, into);
+            FfiConverterBool.write(value.mobile, into);
+            FfiConverterBool.write(value.warmPools, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.cuaVolume) +
              FfiConverterBool.allocationSize(value.yourCloud) +
              FfiConverterBool.allocationSize(value.sharing) +
-             FfiConverterBool.allocationSize(value.webUi);
+             FfiConverterBool.allocationSize(value.webUi) +
+             FfiConverterBool.allocationSize(value.secureSpaces) +
+             FfiConverterBool.allocationSize(value.childSpaces) +
+             FfiConverterBool.allocationSize(value.askFirst) +
+             FfiConverterBool.allocationSize(value.ciRunners) +
+             FfiConverterBool.allocationSize(value.tcpShares) +
+             FfiConverterBool.allocationSize(value.mobile) +
+             FfiConverterBool.allocationSize(value.warmPools);
 
         }
     };
@@ -27129,6 +27238,107 @@ const FfiConverterTypeAppHostLimit = (() => {
     return new FFIConverter();
 })();
 
+export type AppHostLimitRow = {
+    /**
+     * `max-spaces`, `max-memory`, `max-disk` or `max-run`.
+     */
+    id: string,
+    /**
+     * "Most Spaces at once".
+     */
+    label: string,
+    /**
+     * One line under it.
+     */
+    help: string,
+    /**
+     * The limit (0: no limit).
+     */
+    value: number,
+    /**
+     * What the number counts: `Spaces`, `GB` or `minutes`.
+     */
+    unit: string,
+    /**
+     * What is in use now ("2 of 4 Spaces", "12 of 32 GB"; "2 Spaces" with
+     * no limit); none for a limit that is about time.
+     */
+    useText?: string,
+    /**
+     * This machine's own total in `unit` (memory and disk), 0 when not
+     * known.
+     */
+    total: number,
+    /**
+     * Use is above the limit (it was lowered below what runs): nothing
+     * is stopped, new Spaces are refused.
+     */
+    over: boolean,
+    /**
+     * "Over limit" while `over`.
+     */
+    overText?: string
+}
+
+/**
+ * Generated factory for {@link AppHostLimitRow} record objects.
+ */
+export const AppHostLimitRow = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<AppHostLimitRow, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<AppHostLimitRow>,
+    });
+})();
+
+const FfiConverterTypeAppHostLimitRow = (() => {
+    type TypeName = AppHostLimitRow;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                id: FfiConverterString.read(from),
+                label: FfiConverterString.read(from),
+                help: FfiConverterString.read(from),
+                value: FfiConverterUInt32.read(from),
+                unit: FfiConverterString.read(from),
+                useText: FfiConverterOptionalString.read(from),
+                total: FfiConverterUInt32.read(from),
+                over: FfiConverterBool.read(from),
+                overText: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.id, into);
+            FfiConverterString.write(value.label, into);
+            FfiConverterString.write(value.help, into);
+            FfiConverterUInt32.write(value.value, into);
+            FfiConverterString.write(value.unit, into);
+            FfiConverterOptionalString.write(value.useText, into);
+            FfiConverterUInt32.write(value.total, into);
+            FfiConverterBool.write(value.over, into);
+            FfiConverterOptionalString.write(value.overText, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.id) +
+             FfiConverterString.allocationSize(value.label) +
+             FfiConverterString.allocationSize(value.help) +
+             FfiConverterUInt32.allocationSize(value.value) +
+             FfiConverterString.allocationSize(value.unit) +
+             FfiConverterOptionalString.allocationSize(value.useText) +
+             FfiConverterUInt32.allocationSize(value.total) +
+             FfiConverterBool.allocationSize(value.over) +
+             FfiConverterOptionalString.allocationSize(value.overText);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type AppHostLoad = {
     /**
      * CPU it offers, in thousandths.
@@ -27486,6 +27696,11 @@ export type AppHostPanelView = {
      */
     limits?: string,
     /**
+     * The limits as number rows (Settings, Sharing), while providing
+     * Spaces: most Spaces, memory and disk in total, longest running time.
+     */
+    limitRows: Array<AppHostLimitRow>,
+    /**
      * "Spaces for your devices", while providing Spaces.
      */
     providedTitle?: string,
@@ -27582,6 +27797,7 @@ const FfiConverterTypeAppHostPanelView = (() => {
                 accessWarning: FfiConverterOptionalString.read(from),
                 toggles: FfiConverterSequenceTypeAppHostToggle.read(from),
                 limits: FfiConverterOptionalString.read(from),
+                limitRows: FfiConverterSequenceTypeAppHostLimitRow.read(from),
                 providedTitle: FfiConverterOptionalString.read(from),
                 provided: FfiConverterSequenceTypeAppHostAccessRow.read(from),
                 providedEmpty: FfiConverterOptionalString.read(from),
@@ -27616,6 +27832,7 @@ const FfiConverterTypeAppHostPanelView = (() => {
             FfiConverterOptionalString.write(value.accessWarning, into);
             FfiConverterSequenceTypeAppHostToggle.write(value.toggles, into);
             FfiConverterOptionalString.write(value.limits, into);
+            FfiConverterSequenceTypeAppHostLimitRow.write(value.limitRows, into);
             FfiConverterOptionalString.write(value.providedTitle, into);
             FfiConverterSequenceTypeAppHostAccessRow.write(value.provided, into);
             FfiConverterOptionalString.write(value.providedEmpty, into);
@@ -27649,6 +27866,7 @@ const FfiConverterTypeAppHostPanelView = (() => {
              FfiConverterOptionalString.allocationSize(value.accessWarning) +
              FfiConverterSequenceTypeAppHostToggle.allocationSize(value.toggles) +
              FfiConverterOptionalString.allocationSize(value.limits) +
+             FfiConverterSequenceTypeAppHostLimitRow.allocationSize(value.limitRows) +
              FfiConverterOptionalString.allocationSize(value.providedTitle) +
              FfiConverterSequenceTypeAppHostAccessRow.allocationSize(value.provided) +
              FfiConverterOptionalString.allocationSize(value.providedEmpty) +
@@ -28027,6 +28245,31 @@ export type AppHostState = {
      */
     maxMacosVms: number,
     /**
+     * Memory the Spaces other machines create here may use in total, in GB
+     * (0: no limit).
+     */
+    maxMemoryGb: number,
+    /**
+     * Disk the Spaces other machines create here may use in total, in GB
+     * (0: no limit).
+     */
+    maxDiskGb: number,
+    /**
+     * How long a Space created here by another machine may run, in minutes
+     * (0: no limit).
+     */
+    maxRunMinutes: number,
+    /**
+     * What those Spaces were given now, in GB.
+     */
+    usedMemoryGb: number,
+    usedDiskGb: number,
+    /**
+     * This machine's own memory and disk in GB (0: not known).
+     */
+    totalMemoryGb: number,
+    totalDiskGb: number,
+    /**
      * The Spaces this machine provides now.
      */
     providedSpaces: Array<AppHostProvidedSpace>,
@@ -28099,6 +28342,13 @@ const FfiConverterTypeAppHostState = (() => {
                 provideSpaces: FfiConverterBool.read(from),
                 maxSpaces: FfiConverterUInt32.read(from),
                 maxMacosVms: FfiConverterUInt32.read(from),
+                maxMemoryGb: FfiConverterUInt32.read(from),
+                maxDiskGb: FfiConverterUInt32.read(from),
+                maxRunMinutes: FfiConverterUInt32.read(from),
+                usedMemoryGb: FfiConverterUInt32.read(from),
+                usedDiskGb: FfiConverterUInt32.read(from),
+                totalMemoryGb: FfiConverterUInt32.read(from),
+                totalDiskGb: FfiConverterUInt32.read(from),
                 providedSpaces: FfiConverterSequenceTypeAppHostProvidedSpace.read(from),
                 spacesAudit: FfiConverterSequenceTypeAppHostSpacesAudit.read(from),
                 spacesAuditError: FfiConverterOptionalString.read(from),
@@ -28128,6 +28378,13 @@ const FfiConverterTypeAppHostState = (() => {
             FfiConverterBool.write(value.provideSpaces, into);
             FfiConverterUInt32.write(value.maxSpaces, into);
             FfiConverterUInt32.write(value.maxMacosVms, into);
+            FfiConverterUInt32.write(value.maxMemoryGb, into);
+            FfiConverterUInt32.write(value.maxDiskGb, into);
+            FfiConverterUInt32.write(value.maxRunMinutes, into);
+            FfiConverterUInt32.write(value.usedMemoryGb, into);
+            FfiConverterUInt32.write(value.usedDiskGb, into);
+            FfiConverterUInt32.write(value.totalMemoryGb, into);
+            FfiConverterUInt32.write(value.totalDiskGb, into);
             FfiConverterSequenceTypeAppHostProvidedSpace.write(value.providedSpaces, into);
             FfiConverterSequenceTypeAppHostSpacesAudit.write(value.spacesAudit, into);
             FfiConverterOptionalString.write(value.spacesAuditError, into);
@@ -28156,6 +28413,13 @@ const FfiConverterTypeAppHostState = (() => {
              FfiConverterBool.allocationSize(value.provideSpaces) +
              FfiConverterUInt32.allocationSize(value.maxSpaces) +
              FfiConverterUInt32.allocationSize(value.maxMacosVms) +
+             FfiConverterUInt32.allocationSize(value.maxMemoryGb) +
+             FfiConverterUInt32.allocationSize(value.maxDiskGb) +
+             FfiConverterUInt32.allocationSize(value.maxRunMinutes) +
+             FfiConverterUInt32.allocationSize(value.usedMemoryGb) +
+             FfiConverterUInt32.allocationSize(value.usedDiskGb) +
+             FfiConverterUInt32.allocationSize(value.totalMemoryGb) +
+             FfiConverterUInt32.allocationSize(value.totalDiskGb) +
              FfiConverterSequenceTypeAppHostProvidedSpace.allocationSize(value.providedSpaces) +
              FfiConverterSequenceTypeAppHostSpacesAudit.allocationSize(value.spacesAudit) +
              FfiConverterOptionalString.allocationSize(value.spacesAuditError) +
@@ -32490,7 +32754,23 @@ export type AppNotchTile = {
     /**
      * Signed in through the Keyvault (and not dismissed): the key badge.
      */
-    signedIn: boolean
+    signedIn: boolean,
+    /**
+     * One of your other machines' desktops, not a Space it provides: the
+     * tile reads "Desktop" and opens the same desktop the machine's page
+     * does, creating nothing.
+     */
+    desktop: boolean,
+    /**
+     * Pinned to the notch (Pin to notch in the Space's "..." menu): the
+     * tiles list pinned ones first.
+     */
+    pinned: boolean,
+    /**
+     * Why a pinned desktop cannot be opened now ("Offline", "Not
+     * shared"); `None` while it can. The tile stays, dimmed, and says it.
+     */
+    note?: string
 }
 
 /**
@@ -32526,7 +32806,10 @@ const FfiConverterTypeAppNotchTile = (() => {
                 location: FfiConverterString.read(from),
                 progress: FfiConverterOptionalUInt32.read(from),
                 progressLabel: FfiConverterOptionalString.read(from),
-                signedIn: FfiConverterBool.read(from)
+                signedIn: FfiConverterBool.read(from),
+                desktop: FfiConverterBool.read(from),
+                pinned: FfiConverterBool.read(from),
+                note: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -32543,6 +32826,9 @@ const FfiConverterTypeAppNotchTile = (() => {
             FfiConverterOptionalUInt32.write(value.progress, into);
             FfiConverterOptionalString.write(value.progressLabel, into);
             FfiConverterBool.write(value.signedIn, into);
+            FfiConverterBool.write(value.desktop, into);
+            FfiConverterBool.write(value.pinned, into);
+            FfiConverterOptionalString.write(value.note, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.id) +
@@ -32557,7 +32843,10 @@ const FfiConverterTypeAppNotchTile = (() => {
              FfiConverterString.allocationSize(value.location) +
              FfiConverterOptionalUInt32.allocationSize(value.progress) +
              FfiConverterOptionalString.allocationSize(value.progressLabel) +
-             FfiConverterBool.allocationSize(value.signedIn);
+             FfiConverterBool.allocationSize(value.signedIn) +
+             FfiConverterBool.allocationSize(value.desktop) +
+             FfiConverterBool.allocationSize(value.pinned) +
+             FfiConverterOptionalString.allocationSize(value.note);
 
         }
     };
@@ -32973,6 +33262,11 @@ export type AppNotchState = {
      */
     signedIn: Array<string>,
     /**
+     * The Spaces and desktops pinned to the notch, in the order they were
+     * pinned (`AppSettings::notch_pinned`): their tiles come first.
+     */
+    pinned: Array<string>,
+    /**
      * "Spaces tab in the notch: Hide" (menu bar only): nothing shows in
      * the notch, and hover, clicks and window drags do nothing.
      */
@@ -33010,6 +33304,7 @@ const FfiConverterTypeAppNotchState = (() => {
                 transfer: FfiConverterOptionalTypeAppNotchTransfer.read(from),
                 keyvault: FfiConverterOptionalString.read(from),
                 signedIn: FfiConverterSequenceString.read(from),
+                pinned: FfiConverterSequenceString.read(from),
                 hidden: FfiConverterBool.read(from)
             };
         }
@@ -33024,6 +33319,7 @@ const FfiConverterTypeAppNotchState = (() => {
             FfiConverterOptionalTypeAppNotchTransfer.write(value.transfer, into);
             FfiConverterOptionalString.write(value.keyvault, into);
             FfiConverterSequenceString.write(value.signedIn, into);
+            FfiConverterSequenceString.write(value.pinned, into);
             FfiConverterBool.write(value.hidden, into);
         }
         allocationSize(value: TypeName): number {
@@ -33037,6 +33333,7 @@ const FfiConverterTypeAppNotchState = (() => {
              FfiConverterOptionalTypeAppNotchTransfer.allocationSize(value.transfer) +
              FfiConverterOptionalString.allocationSize(value.keyvault) +
              FfiConverterSequenceString.allocationSize(value.signedIn) +
+             FfiConverterSequenceString.allocationSize(value.pinned) +
              FfiConverterBool.allocationSize(value.hidden);
 
         }
@@ -40557,6 +40854,13 @@ export type AppSettings = {
      */
     dismissedAccess: Array<string>,
     /**
+     * The Spaces and the machines' desktops pinned to the notch ("Pin to
+     * notch" in a Space's "..." menu), in the order they were pinned: the
+     * notch lists them first ([`crate::notch::tiles_pinned`]). Ids only,
+     * nothing secret; an id whose Space is gone is kept and draws nothing.
+     */
+    notchPinned: Array<string>,
+    /**
      * Keyvault rows may load a site's icon from Google's favicon service
      * when the source browser had none (Settings, Keyvault; on by default).
      * Off, only icons read locally are shown.
@@ -40619,6 +40923,7 @@ const FfiConverterTypeAppSettings = (() => {
                 experiments: FfiConverterTypeAppExperiments.read(from),
                 newUi: FfiConverterOptionalBoolean.read(from),
                 dismissedAccess: FfiConverterSequenceString.read(from),
+                notchPinned: FfiConverterSequenceString.read(from),
                 keyvaultSiteIcons: FfiConverterBool.read(from),
                 teleportChoices: FfiConverterSequenceTypeAppRememberedChoice.read(from),
                 autoConnect: FfiConverterBool.read(from),
@@ -40639,6 +40944,7 @@ const FfiConverterTypeAppSettings = (() => {
             FfiConverterTypeAppExperiments.write(value.experiments, into);
             FfiConverterOptionalBoolean.write(value.newUi, into);
             FfiConverterSequenceString.write(value.dismissedAccess, into);
+            FfiConverterSequenceString.write(value.notchPinned, into);
             FfiConverterBool.write(value.keyvaultSiteIcons, into);
             FfiConverterSequenceTypeAppRememberedChoice.write(value.teleportChoices, into);
             FfiConverterBool.write(value.autoConnect, into);
@@ -40658,6 +40964,7 @@ const FfiConverterTypeAppSettings = (() => {
              FfiConverterTypeAppExperiments.allocationSize(value.experiments) +
              FfiConverterOptionalBoolean.allocationSize(value.newUi) +
              FfiConverterSequenceString.allocationSize(value.dismissedAccess) +
+             FfiConverterSequenceString.allocationSize(value.notchPinned) +
              FfiConverterBool.allocationSize(value.keyvaultSiteIcons) +
              FfiConverterSequenceTypeAppRememberedChoice.allocationSize(value.teleportChoices) +
              FfiConverterBool.allocationSize(value.autoConnect) +
@@ -43581,7 +43888,15 @@ export type AppSpaceMenuInput = {
     /**
      * You may leave it.
      */
-    canLeave: boolean
+    canLeave: boolean,
+    /**
+     * It can be pinned to the notch (not This machine).
+     */
+    canPin: boolean,
+    /**
+     * It is pinned to the notch now (Unpin from notch).
+     */
+    pinned: boolean
 }
 
 /**
@@ -43615,7 +43930,9 @@ const FfiConverterTypeAppSpaceMenuInput = (() => {
                 canShare: FfiConverterBool.read(from),
                 canRename: FfiConverterBool.read(from),
                 canDelete: FfiConverterBool.read(from),
-                canLeave: FfiConverterBool.read(from)
+                canLeave: FfiConverterBool.read(from),
+                canPin: FfiConverterBool.read(from),
+                pinned: FfiConverterBool.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -43630,6 +43947,8 @@ const FfiConverterTypeAppSpaceMenuInput = (() => {
             FfiConverterBool.write(value.canRename, into);
             FfiConverterBool.write(value.canDelete, into);
             FfiConverterBool.write(value.canLeave, into);
+            FfiConverterBool.write(value.canPin, into);
+            FfiConverterBool.write(value.pinned, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeAppSpaceMenuKind.allocationSize(value.kind) +
@@ -43642,7 +43961,9 @@ const FfiConverterTypeAppSpaceMenuInput = (() => {
              FfiConverterBool.allocationSize(value.canShare) +
              FfiConverterBool.allocationSize(value.canRename) +
              FfiConverterBool.allocationSize(value.canDelete) +
-             FfiConverterBool.allocationSize(value.canLeave);
+             FfiConverterBool.allocationSize(value.canLeave) +
+             FfiConverterBool.allocationSize(value.canPin) +
+             FfiConverterBool.allocationSize(value.pinned);
 
         }
     };
@@ -43681,7 +44002,11 @@ export enum AppSpaceMenuItemId {
     /**
      * Leaves it (asks first: `spaces.bulkConfirm`).
      */
-    Leave = "leave"
+    Leave = "leave",
+    /**
+     * Pins it to the notch, or unpins it (the label says which).
+     */
+    Pin = "pin"
 }
 
 const FfiConverterTypeAppSpaceMenuItemId = (() => {
@@ -43698,6 +44023,7 @@ const FfiConverterTypeAppSpaceMenuItemId = (() => {
                 case 6: return AppSpaceMenuItemId.Rename;
                 case 7: return AppSpaceMenuItemId.Delete;
                 case 8: return AppSpaceMenuItemId.Leave;
+                case 9: return AppSpaceMenuItemId.Pin;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -43711,6 +44037,7 @@ const FfiConverterTypeAppSpaceMenuItemId = (() => {
                 case AppSpaceMenuItemId.Rename: return ordinalConverter.write(6, into);
                 case AppSpaceMenuItemId.Delete: return ordinalConverter.write(7, into);
                 case AppSpaceMenuItemId.Leave: return ordinalConverter.write(8, into);
+                case AppSpaceMenuItemId.Pin: return ordinalConverter.write(9, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -46054,7 +46381,7 @@ const FfiConverterTypeAppWizardFact = (() => {
 export type AppWizardField = {
     /**
      * `os`, `image`, `placement`, `kind`, `runtime`, `connect-cloud`,
-     * `connect-by-address`, `cpus`, `memory`, `disk`, `name`,
+     * `cpus`, `memory`, `disk`, `name`,
      * `open-when-ready`, `address`, `token`, `address-name`.
      */
     id: string,
@@ -50043,6 +50370,69 @@ const FfiConverterTypeKvApprovalView = (() => {
     return new FFIConverter();
 })();
 
+export type KvBrowserProfile = {
+    /**
+     * Directory name (`Default`, `Profile 1`).
+     */
+    dir: string,
+    /**
+     * The name the person gave it.
+     */
+    name: string,
+    /**
+     * The account signed in to it.
+     */
+    account?: string,
+    /**
+     * The browser used it last.
+     */
+    lastUsed: boolean
+}
+
+/**
+ * Generated factory for {@link KvBrowserProfile} record objects.
+ */
+export const KvBrowserProfile = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<KvBrowserProfile, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<KvBrowserProfile>,
+    });
+})();
+
+const FfiConverterTypeKvBrowserProfile = (() => {
+    type TypeName = KvBrowserProfile;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                dir: FfiConverterString.read(from),
+                name: FfiConverterString.read(from),
+                account: FfiConverterOptionalString.read(from),
+                lastUsed: FfiConverterBool.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.dir, into);
+            FfiConverterString.write(value.name, into);
+            FfiConverterOptionalString.write(value.account, into);
+            FfiConverterBool.write(value.lastUsed, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.dir) +
+             FfiConverterString.allocationSize(value.name) +
+             FfiConverterOptionalString.allocationSize(value.account) +
+             FfiConverterBool.allocationSize(value.lastUsed);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export enum KvCategory {
     /**
      * Every item, grouped by app.
@@ -51160,6 +51550,160 @@ const FfiConverterTypeKvPassphraseCheck = (() => {
             return FfiConverterBool.allocationSize(value.canSubmit) +
              FfiConverterOptionalTypeKvStrength.allocationSize(value.strength) +
              FfiConverterOptionalString.allocationSize(value.hint);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export type KvReadinessCheck = {
+    /**
+     * `granted`, `denied` or `unknown` (only known by trying).
+     */
+    state: string,
+    /**
+     * What it means and what to do, in plain words (empty when nothing).
+     */
+    say: string
+}
+
+/**
+ * Generated factory for {@link KvReadinessCheck} record objects.
+ */
+export const KvReadinessCheck = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<KvReadinessCheck, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<KvReadinessCheck>,
+    });
+})();
+
+const FfiConverterTypeKvReadinessCheck = (() => {
+    type TypeName = KvReadinessCheck;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                state: FfiConverterString.read(from),
+                say: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.state, into);
+            FfiConverterString.write(value.say, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.state) +
+             FfiConverterString.allocationSize(value.say);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export type KvReadiness = {
+    /**
+     * Provider id.
+     */
+    providerId: string,
+    /**
+     * App name.
+     */
+    appDisplay: string,
+    /**
+     * The Keyvault exists.
+     */
+    keyvaultInitialized: boolean,
+    /**
+     * The Keyvault is unlocked.
+     */
+    keyvaultUnlocked: boolean,
+    /**
+     * The profile checked: the one asked for, else the last used.
+     */
+    profile?: string,
+    /**
+     * The profile a teleport reads when none is named.
+     */
+    defaultProfile?: string,
+    /**
+     * Every profile.
+     */
+    profiles: Array<KvBrowserProfile>,
+    /**
+     * Reading the app's files (Full Disk Access).
+     */
+    files: KvReadinessCheck,
+    /**
+     * Reading the app's open tabs (Automation).
+     */
+    tabs: KvReadinessCheck,
+    /**
+     * The checked profile has no sign-in data.
+     */
+    profileEmpty: boolean
+}
+
+/**
+ * Generated factory for {@link KvReadiness} record objects.
+ */
+export const KvReadiness = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<KvReadiness, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<KvReadiness>,
+    });
+})();
+
+const FfiConverterTypeKvReadiness = (() => {
+    type TypeName = KvReadiness;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                providerId: FfiConverterString.read(from),
+                appDisplay: FfiConverterString.read(from),
+                keyvaultInitialized: FfiConverterBool.read(from),
+                keyvaultUnlocked: FfiConverterBool.read(from),
+                profile: FfiConverterOptionalString.read(from),
+                defaultProfile: FfiConverterOptionalString.read(from),
+                profiles: FfiConverterSequenceTypeKvBrowserProfile.read(from),
+                files: FfiConverterTypeKvReadinessCheck.read(from),
+                tabs: FfiConverterTypeKvReadinessCheck.read(from),
+                profileEmpty: FfiConverterBool.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.providerId, into);
+            FfiConverterString.write(value.appDisplay, into);
+            FfiConverterBool.write(value.keyvaultInitialized, into);
+            FfiConverterBool.write(value.keyvaultUnlocked, into);
+            FfiConverterOptionalString.write(value.profile, into);
+            FfiConverterOptionalString.write(value.defaultProfile, into);
+            FfiConverterSequenceTypeKvBrowserProfile.write(value.profiles, into);
+            FfiConverterTypeKvReadinessCheck.write(value.files, into);
+            FfiConverterTypeKvReadinessCheck.write(value.tabs, into);
+            FfiConverterBool.write(value.profileEmpty, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.providerId) +
+             FfiConverterString.allocationSize(value.appDisplay) +
+             FfiConverterBool.allocationSize(value.keyvaultInitialized) +
+             FfiConverterBool.allocationSize(value.keyvaultUnlocked) +
+             FfiConverterOptionalString.allocationSize(value.profile) +
+             FfiConverterOptionalString.allocationSize(value.defaultProfile) +
+             FfiConverterSequenceTypeKvBrowserProfile.allocationSize(value.profiles) +
+             FfiConverterTypeKvReadinessCheck.allocationSize(value.files) +
+             FfiConverterTypeKvReadinessCheck.allocationSize(value.tabs) +
+             FfiConverterBool.allocationSize(value.profileEmpty);
 
         }
     };
@@ -52789,7 +53333,11 @@ export type TeleportConsent = {
      * The sites whose saved passwords to send (the review's own
      * choice; `None`: those of `cookie_domains`).
      */
-    passwordDomains?: Array<string>
+    passwordDomains?: Array<string>,
+    /**
+     * The browser profile to read (`Profile 1`); `None`: `Default`.
+     */
+    profile?: string
 }
 
 /**
@@ -52804,7 +53352,8 @@ export const TeleportConsent = (() => {
         exclude: [],
         fromVault: undefined,
         includePasswords: false,
-        passwordDomains: undefined
+        passwordDomains: undefined,
+        profile: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<TeleportConsent, ReturnType<typeof defaults>>(defaults);
@@ -52829,7 +53378,8 @@ const FfiConverterTypeTeleportConsent = (() => {
                 exclude: FfiConverterSequenceString.read(from),
                 fromVault: FfiConverterOptionalSequenceString.read(from),
                 includePasswords: FfiConverterBool.read(from),
-                passwordDomains: FfiConverterOptionalSequenceString.read(from)
+                passwordDomains: FfiConverterOptionalSequenceString.read(from),
+                profile: FfiConverterOptionalString.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -52842,6 +53392,7 @@ const FfiConverterTypeTeleportConsent = (() => {
             FfiConverterOptionalSequenceString.write(value.fromVault, into);
             FfiConverterBool.write(value.includePasswords, into);
             FfiConverterOptionalSequenceString.write(value.passwordDomains, into);
+            FfiConverterOptionalString.write(value.profile, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.approved) +
@@ -52852,7 +53403,8 @@ const FfiConverterTypeTeleportConsent = (() => {
              FfiConverterSequenceString.allocationSize(value.exclude) +
              FfiConverterOptionalSequenceString.allocationSize(value.fromVault) +
              FfiConverterBool.allocationSize(value.includePasswords) +
-             FfiConverterOptionalSequenceString.allocationSize(value.passwordDomains);
+             FfiConverterOptionalSequenceString.allocationSize(value.passwordDomains) +
+             FfiConverterOptionalString.allocationSize(value.profile);
 
         }
     };
@@ -58277,7 +58829,8 @@ export enum AppNotchEvent_Tags {
     Escape = "Escape",
     Visibility = "Visibility",
     Activity = "Activity",
-    Keyvault = "Keyvault"
+    Keyvault = "Keyvault",
+    Pinned = "Pinned"
 }
 export const AppNotchEvent = (() => {
 
@@ -58708,6 +59261,41 @@ inner: {label?: string; signedIn: Array<string> }): Keyvault_ {
 
     }
 
+    type Pinned__interface = {
+        tag: AppNotchEvent_Tags.Pinned;
+        inner:
+Readonly<{ids: Array<string>}>
+    };
+    /**
+     * The pinned Spaces and desktops changed (Pin to notch, Unpin from
+     * notch, or settings read at start): their ids in pin order.
+     */
+    class Pinned_ extends UniffiEnum implements Pinned__interface {
+        /**
+         * @private
+         * This field is private and should not be used, use `tag` instead.
+         */
+        readonly [uniffiTypeNameSymbol] = "AppNotchEvent";
+        readonly tag = AppNotchEvent_Tags.Pinned;
+        readonly inner:
+Readonly<{ids: Array<string>}>;
+        constructor(
+inner: {ids: Array<string> }) {
+            super("AppNotchEvent", "Pinned");
+
+            this.inner = Object.freeze(inner);
+        }
+        static new(
+inner: {ids: Array<string> }): Pinned_ {
+            return new Pinned_(inner);
+        }
+
+        static instanceOf(obj: any): obj is Pinned_ {
+            return obj.tag === AppNotchEvent_Tags.Pinned;
+        }
+
+    }
+
     function instanceOf(obj: any): obj is AppNotchEvent {
         return obj[uniffiTypeNameSymbol] === "AppNotchEvent";
     }
@@ -58727,12 +59315,13 @@ inner: {label?: string; signedIn: Array<string> }): Keyvault_ {
   Escape: Escape_,
   Visibility: Visibility_,
   Activity: Activity_,
-  Keyvault: Keyvault_
+  Keyvault: Keyvault_,
+  Pinned: Pinned_
     });
 
 })();
 export type AppNotchEvent = InstanceType<
-    typeof AppNotchEvent['HoverEnter' | 'HoverExit' | 'DwellElapsed' | 'CloseElapsed' | 'Click' | 'Dismiss' | 'DropTargeted' | 'Drag' | 'DragPermission' | 'Search' | 'Escape' | 'Visibility' | 'Activity' | 'Keyvault']
+    typeof AppNotchEvent['HoverEnter' | 'HoverExit' | 'DwellElapsed' | 'CloseElapsed' | 'Click' | 'Dismiss' | 'DropTargeted' | 'Drag' | 'DragPermission' | 'Search' | 'Escape' | 'Visibility' | 'Activity' | 'Keyvault' | 'Pinned']
 >;
 
 // FfiConverter for enum AppNotchEvent
@@ -58756,6 +59345,7 @@ const FfiConverterTypeAppNotchEvent = (() => {
                 case 12: return new AppNotchEvent.Visibility({shown: FfiConverterBool.read(from) });
                 case 13: return new AppNotchEvent.Activity({hotspot: FfiConverterBool.read(from), transfer: FfiConverterOptionalTypeAppNotchTransfer.read(from) });
                 case 14: return new AppNotchEvent.Keyvault({label: FfiConverterOptionalString.read(from), signedIn: FfiConverterSequenceString.read(from) });
+                case 15: return new AppNotchEvent.Pinned({ids: FfiConverterSequenceString.read(from) });
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -58833,6 +59423,12 @@ const FfiConverterTypeAppNotchEvent = (() => {
                     FfiConverterSequenceString.write(inner.signedIn, into);
                     return;
                 }
+                case AppNotchEvent_Tags.Pinned: {
+                    ordinalConverter.write(15, into);
+                    const inner = value.inner;
+                    FfiConverterSequenceString.write(inner.ids, into);
+                    return;
+                }
                 default:
                     // Throwing from here means that AppNotchEvent_Tags hasn't matched an ordinal.
                     throw new UniffiInternalError.UnexpectedEnumCase();
@@ -58903,6 +59499,12 @@ const FfiConverterTypeAppNotchEvent = (() => {
                     let size = ordinalConverter.allocationSize(14);
                     size += FfiConverterOptionalString.allocationSize(inner.label);
                     size += FfiConverterSequenceString.allocationSize(inner.signedIn);
+                    return size;
+                }
+                case AppNotchEvent_Tags.Pinned: {
+                    const inner = value.inner;
+                    let size = ordinalConverter.allocationSize(15);
+                    size += FfiConverterSequenceString.allocationSize(inner.ids);
                     return size;
                 }
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
@@ -67456,6 +68058,12 @@ export interface KeyvaultClientLike {
  */
     overview(asyncOpts_?: { signal: AbortSignal }): Promise<KeyvaultOverview>;
 /**
+ * Whether a teleport of `app` can work now: the Keyvault's state, what
+ * macOS lets the daemon read, and the profiles. Reads no value and asks
+ * for no presence.
+ */
+    readiness(app: string, profile: string | undefined, asyncOpts_?: { signal: AbortSignal }) /*throws*/: Promise<KvReadiness>;
+/**
  * Creates the vault with a passphrase (and a recovery key, returned
  * once). The passphrase goes only to the broker over the verified
  * Keyvault socket; it is never logged or kept, and zeroized here.
@@ -67667,6 +68275,43 @@ export class KeyvaultClient extends UniffiAbstractObject implements KeyvaultClie
             /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
             /*asyncOpts:*/ asyncOpts_,
 
+        );
+    } catch (__error: any) {
+        if (uniffiIsDebug && __error instanceof Error) {
+            __error.stack = __stack;
+        }
+        throw __error;
+    }
+    }
+
+/**
+ * Whether a teleport of `app` can work now: the Keyvault's state, what
+ * macOS lets the daemon read, and the profiles. Reads no value and asks
+ * for no presence.
+ */
+    async readiness(app: string, profile: string | undefined, asyncOpts_?: { signal: AbortSignal }): Promise<KvReadiness> /*throws*/ {
+    const __stack = uniffiIsDebug ? new Error().stack : undefined;
+    try {
+        return await uniffiRustCallAsync(
+            /*rustCaller:*/ uniffiCaller,
+            /*rustFutureFunc:*/ () => {
+                return nativeModule().uniffi_cua_spaces_ffi_fn_method_keyvaultclient_readiness(
+                    uniffiTypeKeyvaultClientObjectFactory.clonePointer(this),FfiConverterString.lower(app, nativeModule().rustbuffer_alloc),FfiConverterOptionalString.lower(profile, nativeModule().rustbuffer_alloc)
+                );
+            },
+            /*pollFunc:*/ nativeModule().ffi_cua_spaces_ffi_rust_future_poll_rust_buffer,
+            /*cancelFunc:*/ nativeModule().ffi_cua_spaces_ffi_rust_future_cancel_rust_buffer,
+            /*completeFunc:*/ nativeModule().ffi_cua_spaces_ffi_rust_future_complete_rust_buffer,
+            /*freeFunc:*/ nativeModule().ffi_cua_spaces_ffi_rust_future_free_rust_buffer,
+            // Async returns always go through the JS-side converter: the
+            // FFI symbol returns the future handle (u64), and the user-level
+            // RustBuffer comes back via the shared `rust_future_complete_*`
+            // export. The bytes the runtime hands back must be deserialized
+            // here using the per-callable return-type converter.
+            /*liftFunc:*/ FfiConverterTypeKvReadiness.lift.bind(FfiConverterTypeKvReadiness),
+            /*liftString:*/ FfiConverterString.lift.bind(FfiConverterString),
+            /*asyncOpts:*/ asyncOpts_,
+            /*errorHandler:*/ FfiConverterTypeCuaError.lift.bind(FfiConverterTypeCuaError)
         );
     } catch (__error: any) {
         if (uniffiIsDebug && __error instanceof Error) {
@@ -69477,6 +70122,9 @@ const FfiConverterSequenceTypeAppLineView = new FfiConverterArray(FfiConverterTy
 // FfiConverter for AppFileView | undefined
 const FfiConverterOptionalTypeAppFileView = new FfiConverterOptional(FfiConverterTypeAppFileView);
 
+// FfiConverter for Map<string, string>
+const FfiConverterMapStringString = new FfiConverterMap(FfiConverterString, FfiConverterString);
+
 // FfiConverter for bigint | undefined
 const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 
@@ -69705,9 +70353,6 @@ const FfiConverterSequenceTypeAppDeviceInput = new FfiConverterArray(FfiConverte
 // FfiConverter for Array<AppAuditInput>
 const FfiConverterSequenceTypeAppAuditInput = new FfiConverterArray(FfiConverterTypeAppAuditInput);
 
-// FfiConverter for Map<string, string>
-const FfiConverterMapStringString = new FfiConverterMap(FfiConverterString, FfiConverterString);
-
 // FfiConverter for Array<AppMachineInput>
 const FfiConverterSequenceTypeAppMachineInput = new FfiConverterArray(FfiConverterTypeAppMachineInput);
 
@@ -69827,6 +70472,9 @@ const FfiConverterSequenceTypeAppHostAccessRow = new FfiConverterArray(FfiConver
 
 // FfiConverter for Array<AppHostToggle>
 const FfiConverterSequenceTypeAppHostToggle = new FfiConverterArray(FfiConverterTypeAppHostToggle);
+
+// FfiConverter for Array<AppHostLimitRow>
+const FfiConverterSequenceTypeAppHostLimitRow = new FfiConverterArray(FfiConverterTypeAppHostLimitRow);
 
 // FfiConverter for Array<AppPermissionRow>
 const FfiConverterSequenceTypeAppPermissionRow = new FfiConverterArray(FfiConverterTypeAppPermissionRow);
@@ -70301,6 +70949,9 @@ const FfiConverterOptionalTypeKvCredentialForm = new FfiConverterOptional(FfiCon
 
 // FfiConverter for KvStrength | undefined
 const FfiConverterOptionalTypeKvStrength = new FfiConverterOptional(FfiConverterTypeKvStrength);
+
+// FfiConverter for Array<KvBrowserProfile>
+const FfiConverterSequenceTypeKvBrowserProfile = new FfiConverterArray(FfiConverterTypeKvBrowserProfile);
 
 // FfiConverter for Array<KvCategoryRow>
 const FfiConverterSequenceTypeKvCategoryRow = new FfiConverterArray(FfiConverterTypeKvCategoryRow);
@@ -70954,6 +71605,9 @@ function uniffiEnsureInitialized() {
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_notch_tile_at() !== 23982) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_notch_tile_at");
     }
+    if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_notch_toggle_pin() !== 49031) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_notch_toggle_pin");
+    }
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_notch_view() !== 50142) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_notch_view");
     }
@@ -71164,7 +71818,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_input_from_json() !== 15437) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_settings_input_from_json");
     }
-    if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_load() !== 42027) {
+    if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_load() !== 56775) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_settings_load");
     }
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_page() !== 454) {
@@ -71173,7 +71827,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_resolve_new_ui() !== 48081) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_settings_resolve_new_ui");
     }
-    if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_save() !== 30129) {
+    if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_save() !== 62204) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_func_app_settings_save");
     }
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_func_app_settings_with_storage() !== 34252) {
@@ -71581,6 +72235,9 @@ function uniffiEnsureInitialized() {
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_method_keyvaultclient_overview() !== 65171) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_method_keyvaultclient_overview");
     }
+    if (nativeModule().uniffi_cua_spaces_ffi_checksum_method_keyvaultclient_readiness() !== 1765) {
+        throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_method_keyvaultclient_readiness");
+    }
     if (nativeModule().uniffi_cua_spaces_ffi_checksum_method_keyvaultclient_setup_with_passphrase() !== 6939) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cua_spaces_ffi_checksum_method_keyvaultclient_setup_with_passphrase");
     }
@@ -71870,6 +72527,7 @@ export default Object.freeze({
     FfiConverterTypeAppHostFormState,
     FfiConverterTypeAppHostFormView,
     FfiConverterTypeAppHostLimit,
+    FfiConverterTypeAppHostLimitRow,
     FfiConverterTypeAppHostLoad,
     FfiConverterTypeAppHostPanelView,
     FfiConverterTypeAppHostPermissionInput,
@@ -72192,6 +72850,7 @@ export default Object.freeze({
     FfiConverterTypeKvApprovalState,
     FfiConverterTypeKvApprovalView,
     FfiConverterTypeKvAuditEntry,
+    FfiConverterTypeKvBrowserProfile,
     FfiConverterTypeKvCaller,
     FfiConverterTypeKvCategory,
     FfiConverterTypeKvCategoryRow,
@@ -72218,6 +72877,8 @@ export default Object.freeze({
     FfiConverterTypeKvPassphraseCheck,
     FfiConverterTypeKvPending,
     FfiConverterTypeKvPendingRow,
+    FfiConverterTypeKvReadiness,
+    FfiConverterTypeKvReadinessCheck,
     FfiConverterTypeKvRecentRow,
     FfiConverterTypeKvRule,
     FfiConverterTypeKvRuleCaller,
