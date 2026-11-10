@@ -1428,7 +1428,7 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
         "appkit",
         "press_key_command",
         Targeting::Px,
-        DriverRoute::MacosCgEventPid,
+        DriverRoute::MacosAxAction,
     );
     let cell_id = case.cell_id.clone();
     execute_case(case, |evidence| {
@@ -1480,7 +1480,9 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                     "background Return failed: {}",
                     pressed.text()
                 );
-                assert_eq!(pressed.action_route(), Some("synthetic_events"));
+                // The focused field advertises AXConfirm, so the unmodified
+                // Return is that action rather than a posted key.
+                assert_eq!(pressed.action_route(), Some("accessibility"));
                 assert_eq!(pressed.action_delivery_mode(), Some("background"));
                 assert_eq!(pressed.action_effect(), Some("unverifiable"));
                 assert!(

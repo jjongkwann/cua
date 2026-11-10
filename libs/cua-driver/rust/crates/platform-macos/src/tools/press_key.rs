@@ -199,6 +199,79 @@ fn with_confirmed_key_focus<T>(
     dispatch()
 }
 
+/// The AX action that does what an unmodified Return or Escape does, for a
+/// control that advertises it. Any modifier keeps the key as key events.
+fn semantic_key_action(key: &str, modifiers: &[String]) -> Option<&'static str> {
+    if !modifiers.is_empty() {
+        return None;
+    }
+    match key.to_ascii_lowercase().as_str() {
+        "return" | "enter" => Some("AXConfirm"),
+        "escape" | "esc" => Some("AXCancel"),
+        _ => None,
+    }
+}
+
+/// Perform `action` on the key's target instead of posting the key: the
+/// `explicit` element (from `element_token`), else the focused element of
+/// `window_id` (or of the app without one). `Ok(false)` when there is no such
+/// target, it does not advertise `action`, it reports itself disabled, or it
+/// is web content (a page handles Return and Escape as DOM key events); the
+/// caller then posts the key as before. Nothing has been sent in that case.
+fn try_semantic_key(
+    pid: i32,
+    window_id: Option<u32>,
+    explicit: Option<usize>,
+    action: &str,
+) -> anyhow::Result<bool> {
+    let (element, owned) = match explicit {
+        Some(ptr) => (ptr, false),
+        None => match unsafe {
+            match window_id {
+                Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+                None => focused_element_of_pid(pid),
+            }
+        } {
+            Some(element) => (element as usize, true),
+            None => return Ok(false),
+        },
+    };
+    let performed = (|| {
+        let el = element as AXUIElementRef;
+        let applies = unsafe { crate::ax::bindings::copy_action_names(el) }
+            .iter()
+            .any(|name| name == action)
+            && unsafe { copy_bool_attr(el, "AXEnabled") } != Some(false)
+            && !super::type_text::target_in_web_area(pid, Some((element, None)), window_id);
+        if !applies {
+            return Ok(false);
+        }
+        match unsafe { crate::ax::bindings::perform_action(el, action) } {
+            0 => Ok(true),
+            error => anyhow::bail!("{action} failed with AX error {error}"),
+        }
+    })();
+    if owned {
+        unsafe { CFRelease(element as _) };
+    }
+    performed
+}
+
+fn semantic_key_record(action: &str) -> ActionExecutionRecord {
+    ActionExecutionRecord::builder(
+        ActionEffect::Unverifiable,
+        ActionTransport::MacosAxAction,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(ActualDelivery::Background)
+    .evidence(ActionEvidence {
+        kind: EvidenceKind::NativeApiResult,
+        detail: format!("{action} returned success on the key's target element"),
+    })
+    .build()
+    .expect("press_key AX action record is valid")
+}
+
 fn delivery_failed(error: anyhow::Error) -> ToolResult {
     if error.is::<KeyFocusUnconfirmed>() {
         return ToolResult::error(error.to_string()).with_structured(serde_json::json!({
@@ -220,6 +293,7 @@ fn def() -> &'static ToolDef {
             - `background` (default): posts to the pid without raising the window; with `element_token` it focuses that element first.\n\
             - `foreground`: fronts the exact window (needs `window_id`), sends a real HID key transition (Chromium content, inline editors, menu equivalents), then restores the prior app.\n\
             \n\
+            In the background, an unmodified return/enter or escape is sent as the target's AXConfirm or AXCancel when it advertises one (`path:\"ax_action\"`, no key events); otherwise it is posted as a key.\n\
             An element target whose focus cannot be confirmed is refused with `target_focus_unconfirmed`, effect \"refused\", and no key dispatched.\n\
             Confirmed only when a native AX value/selection read-back changes; otherwise `effect:\"unverifiable\"` (not a delivery failure). Keys: return, tab, escape, up/down/left/right, space, delete, home, end, pageup, pagedown, f1-f12, any letter or digit.".into(),
         input_schema: serde_json::json!({
@@ -435,6 +509,56 @@ impl Tool for PressKeyTool {
         // as the app's key-routing window (synthetic_focus, Binding::Keys),
         // confirmed, or refuses (window_not_key); the binding, the key and
         // the release share one blocking thread with the mutation lease.
+        // An unmodified Return or Escape in the background is the target's
+        // AXConfirm or AXCancel when it advertises one: no key events, so no
+        // window has to be bound as the app's key window.
+        if let Some(action) = semantic_key_action(&key, &modifiers).filter(|_| !fg) {
+            let prior_front = apps::frontmost_pid();
+            let snapshot = focus_guard::FocusPolicy::Suppress.snapshot(prior_front, pid);
+            let explicit = pre_focus_guard.clone();
+            let performed = focus_guard::run_blocking_under(
+                pid,
+                prior_front,
+                focus_guard::FocusPolicy::Suppress,
+                "press_key.AXAction",
+                &mut _mutation_lease,
+                &mut crate::synthetic_focus::Report::default(),
+                move || {
+                    try_semantic_key(
+                        pid,
+                        window_id,
+                        explicit.as_ref().map(|g| g.as_ptr()),
+                        action,
+                    )
+                },
+            )
+            .await;
+            let changes = super::finish_window_observation(snapshot).await;
+            match performed {
+                Ok(Ok(true)) => {
+                    let mut structured = serde_json::json!({
+                        "path": "ax_action",
+                        "ax_action": action,
+                        "verified": false,
+                        "effect": "unverifiable",
+                    });
+                    changes.add_window_identity(&mut structured);
+                    return ToolResult::text(format!(
+                        "✅ Pressed {display_key} on pid {pid} as {action} on the focused \
+                         control (no key events).{}",
+                        changes.result_suffix()
+                    ))
+                    .with_structured(structured)
+                    .with_action_record(semantic_key_record(action));
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => return delivery_failed(error),
+                Err(error) => {
+                    return delivery_failed(anyhow::anyhow!("AX action task failed: {error}"))
+                }
+            }
+        }
+
         let prior_front = apps::frontmost_pid();
         let policy = super::keyboard_focus_policy(window_id, fg);
         let snapshot = policy.snapshot(prior_front, pid);
@@ -640,6 +764,18 @@ mod tests {
             || Ok(()),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn only_an_unmodified_return_or_escape_maps_to_an_ax_action() {
+        let none: Vec<String> = Vec::new();
+        assert_eq!(semantic_key_action("return", &none), Some("AXConfirm"));
+        assert_eq!(semantic_key_action("Enter", &none), Some("AXConfirm"));
+        assert_eq!(semantic_key_action("escape", &none), Some("AXCancel"));
+        assert_eq!(semantic_key_action("esc", &none), Some("AXCancel"));
+        assert_eq!(semantic_key_action("tab", &none), None);
+        assert_eq!(semantic_key_action("return", &["shift".to_string()]), None);
+        assert_eq!(semantic_key_action("escape", &["cmd".to_string()]), None);
     }
 
     #[test]
