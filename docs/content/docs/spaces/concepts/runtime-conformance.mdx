@@ -73,9 +73,8 @@ on a container engine you run on a Linux host.
 
 ### Where the default network is not enforced yet
 
-The default network is the Secure Spaces experiment
-(`cua experiments enable secure-spaces`); this page describes a Space with it
-on. A runtime that cannot enforce it never starts a Space open by accident.
+The default network is Secure Spaces, always on; this page describes a Space
+with it. A runtime that cannot enforce it never starts a Space open by accident.
 Apple's Containerization puts every guest on Apple's vmnet network. Only `pf`
 can filter that network, and `pf` needs root. A firewall inside the guest
 would not hold against the Space's own root, so Cua does not offer one as the
@@ -123,8 +122,8 @@ CUA=/path/to/cua libs/cua/scripts/conformance/run.py --entry vz-microvm --out re
 ```
 
 The children case needs the `cua` CLI in the guest. When the Space under
-test does not ship it, the run makes a home Space from the `agent-home` image
-(the slim Linux image plus the CLI) on the same runtime and runs the case
+test does not ship it, the run makes a home Space from the slim Linux image
+(`ghcr.io/trycua/linux:24.04-slim`, which carries the CLI) on the same runtime and runs the case
 there; `--home-image` and `--entry-home-image ID=IMAGE` name another build.
 
 The roster and what each entry must do is `libs/cua/scripts/conformance/entries.json`,

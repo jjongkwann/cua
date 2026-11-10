@@ -710,7 +710,7 @@ impl Drop for StartingMarker {
 }
 
 /// Contents of the discovery file.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Discovery {
     /// Daemon pid.
     pub pid: u32,
@@ -722,6 +722,18 @@ pub struct Discovery {
     pub token: Option<String>,
     /// Daemon version.
     pub version: String,
+}
+
+impl std::fmt::Debug for Discovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Discovery")
+            .field("pid", &self.pid)
+            .field("socket_path", &self.socket_path)
+            .field("loopback_url", &self.loopback_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("version", &self.version)
+            .finish()
+    }
 }
 
 impl Discovery {
@@ -1164,7 +1176,9 @@ mod instance_lock_tests {
         assert_eq!(held.pid, Some(std::process::id()));
         assert!(held.to_string().contains("cua daemon stop"), "{held}");
         drop(first);
-        InstanceLock::acquire(&path, Duration::ZERO).unwrap();
+        // A child another test spawns in this window holds a copy of the
+        // locked descriptor until its exec closes it, so wait like a daemon.
+        InstanceLock::acquire(&path, Duration::from_secs(5)).unwrap();
     }
 
     /// A daemon waiting for the lock gets it when the old one exits within

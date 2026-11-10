@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! SkyLight SPI bridge — Rust port of Swift's `SkyLightEventPost`.
 //!
 //! Two-layer story (matches Swift reference exactly):
@@ -739,7 +742,7 @@ pub fn activate_without_raise_with(
     target_wid: u32,
     defocus_front: bool,
 ) -> bool {
-    crate::window_change_detector::end_tail();
+    crate::focus_arbiter::end_detached();
     let post_fn = match post_event_record_to_fn() {
         Some(f) => f,
         None => return false,
@@ -925,7 +928,7 @@ pub fn front_process_matches(target_pid: libc::pid_t, target_wid: u32) -> Option
 /// Returns `true` only when the target PSN resolved and WindowServer accepted
 /// `SLPSSetFrontProcessWithOptions`.
 pub fn set_front_process_persistently(target_pid: libc::pid_t, target_wid: u32) -> bool {
-    crate::window_change_detector::note_intentional_activation();
+    crate::focus_arbiter::note_intentional();
     let Some(set_front) = set_front_process_fn() else {
         return false;
     };
@@ -959,6 +962,18 @@ fn make_key_window_record(window_id: u32, event_kind: u8) -> [u8; 0xF8] {
 /// make-key records for the requested WindowServer id, then let the caller
 /// raise the matching AX window. No other application window is addressed.
 pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
+    crate::focus_arbiter::note_intentional();
+    exact_window_key(target_pid, target_wid)
+}
+
+/// Give the user's window `wid` of `pid` key and front back after a target
+/// took it, by the same sequence as [`make_exact_window_key`]. Not a driver
+/// activation: the watcher that undoes the target's change keeps running.
+pub fn return_key_to(pid: libc::pid_t, wid: u32) -> bool {
+    exact_window_key(pid, wid)
+}
+
+fn exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
     let Some(set_front) = set_front_process_fn() else {
         return false;
     };
@@ -1018,10 +1033,9 @@ pub fn foreground_turn_active() -> bool {
 }
 
 fn foreground_turn() -> ForegroundTurn {
-    // An intentional activation ends the previous action's detached window
-    // watch, whose wildcard lease would otherwise revert it.
-    crate::window_change_detector::end_tail();
-    crate::window_change_detector::note_intentional_activation();
+    // Watchers armed before this, including the previous action's detached
+    // window watch, no longer undo an activation.
+    crate::focus_arbiter::note_intentional();
     if HOLDS_FOREGROUND_LOCK.with(std::cell::Cell::get) {
         return ForegroundTurn { _guard: None };
     }
@@ -1132,7 +1146,7 @@ const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
     loop {
-        if crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id) {
+        if crate::ax::bindings::focused_window_id_of_pid(pid).is_some_and(|w| w.is(window_id)) {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -1148,15 +1162,16 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
 /// (a closed Chrome omnibox popup) and can never be key. Empty when neither
 /// is proven.
 fn focus_failure_hint(pid: libc::pid_t, target_wid: u32) -> String {
-    let target = crate::windows::window_info_by_id(target_wid);
-    let focused =
-        crate::ax::bindings::focused_window_id_of_pid(pid).filter(|focused| *focused != target_wid);
+    let target = crate::windows::describe_window(target_wid);
+    let focused = crate::ax::bindings::focused_window_id_of_pid(pid)
+        .filter(|focused| !focused.is(target_wid))
+        .map(|focused| focused.own);
     focus_failure_hint_from(
         target.as_ref().map(|window| {
             window.is_on_screen && window.bounds.width >= 2.0 && window.bounds.height >= 2.0
         }),
         focused.map(|window_id| {
-            let title = crate::windows::window_info_by_id(window_id)
+            let title = crate::windows::describe_window(window_id)
                 .map(|window| window.title)
                 .unwrap_or_default();
             (window_id, title)
@@ -1258,12 +1273,12 @@ fn preserves_exact_existing_focus(
     previous_process_known: bool,
     previous_psn: [u8; 8],
     target_psn: [u8; 8],
-    focused_window_id: Option<u32>,
+    focused_window_id: Option<crate::ax::exact_target::AxWindowId>,
     target_window_id: u32,
 ) -> bool {
     previous_process_known
         && previous_psn == target_psn
-        && focused_window_id == Some(target_window_id)
+        && focused_window_id.is_some_and(|focused| focused.is(target_window_id))
 }
 
 #[cfg(test)]
@@ -1273,6 +1288,7 @@ mod tests {
         preserves_exact_existing_focus, reset_windowserver_connection_invalid_for_test,
         windowserver_connection_invalid, WINDOWSERVER_INVALID_CONNECTION,
     };
+    use crate::ax::exact_target::AxWindowId;
 
     #[test]
     fn a_1002_post_status_is_remembered_and_other_failures_are_not() {
@@ -1344,7 +1360,22 @@ mod tests {
     #[test]
     fn exact_existing_focus_avoids_reactivation() {
         let psn = [1, 2, 3, 4, 5, 6, 7, 8];
-        assert!(preserves_exact_existing_focus(true, psn, psn, Some(42), 42));
+        assert!(preserves_exact_existing_focus(
+            true,
+            psn,
+            psn,
+            Some(AxWindowId::window(42)),
+            42
+        ));
+    }
+
+    #[test]
+    fn a_focused_sheet_avoids_reactivation_for_the_sheet_and_its_window() {
+        let psn = [1, 2, 3, 4, 5, 6, 7, 8];
+        let sheet = Some(AxWindowId { own: 43, root: 42 });
+        assert!(preserves_exact_existing_focus(true, psn, psn, sheet, 42));
+        assert!(preserves_exact_existing_focus(true, psn, psn, sheet, 43));
+        assert!(!preserves_exact_existing_focus(true, psn, psn, sheet, 41));
     }
 
     #[test]
@@ -1355,21 +1386,21 @@ mod tests {
             false,
             target,
             target,
-            Some(42),
+            Some(AxWindowId::window(42)),
             42
         ));
         assert!(!preserves_exact_existing_focus(
             true,
             other,
             target,
-            Some(42),
+            Some(AxWindowId::window(42)),
             42
         ));
         assert!(!preserves_exact_existing_focus(
             true,
             target,
             target,
-            Some(41),
+            Some(AxWindowId::window(41)),
             42
         ));
         assert!(!preserves_exact_existing_focus(

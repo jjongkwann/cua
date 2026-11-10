@@ -329,7 +329,8 @@ impl Host for Live {
                 let parent = (crate::ax::bindings::copy_string_attr(window, "AXRole").as_deref()
                     == Some("AXSheet"))
                 .then(|| crate::ax::exact_target::element_window_id(window))
-                .flatten();
+                .flatten()
+                .map(|window| window.root);
                 core_foundation::base::CFRelease(window as _);
                 parent
             });
@@ -354,7 +355,7 @@ impl Host for Live {
     }
 
     fn user_input_recently(&mut self) -> bool {
-        crate::key_focus_guard::user_switched_recently()
+        crate::focus_arbiter::user_switched_recently()
     }
 
     fn post_activation(&mut self, pid: i32, window: u32) -> bool {
@@ -761,7 +762,7 @@ impl Drop for TargetFocus {
 pub fn enter(pid: i32, window: u32, binding: Binding) -> Result<TargetFocus, Refusal> {
     // A new binding supersedes the previous action's detached window watch,
     // as the other focus primitives do.
-    crate::window_change_detector::end_tail();
+    crate::focus_arbiter::end_detached();
     enter_with(&mut Live, pid, window, binding).map(|entered| TargetFocus {
         entered: Some(entered),
     })

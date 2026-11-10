@@ -2,6 +2,8 @@
 //! narrow channel only it can reach.
 //!
 //! - [`capability`]: the per-Space spawn capability this host mints.
+//! - [`home`]: what an agent home (a Space made on the first ask-first request and reused)
+//!   may reach beyond its own tree, and what the person must approve.
 //! - [`tree`]: who is whose child; every answer stays inside the caller's
 //!   subtree.
 //! - [`api`]: `SpaceService` and `DaemonService` answered for one Space's
@@ -17,7 +19,9 @@ pub mod api;
 pub mod bridge;
 pub mod budget;
 pub mod capability;
+pub mod home;
 pub mod reaper;
+pub mod runs;
 #[cfg(test)]
 mod tests;
 pub mod tree;

@@ -64,6 +64,7 @@ pub const SPACES_TOOL_METHODS: &[(&str, &str)] = &[
     ("agent_capabilities", "Spaces.agent_capabilities"),
     ("agent_threads", "Spaces.call_tool_json"),
     ("agent_thread_read", "Spaces.call_tool_json"),
+    ("agent_sign_in", "Spaces.call_tool_json"),
     ("agent_add", "Spaces.persistent_agent_create"),
     ("persistent_agent_list", "Spaces.persistent_agents"),
     ("agent_remove", "Spaces.persistent_agent_remove"),
@@ -290,6 +291,8 @@ impl EgressEnforcement {
 /// - `localhost`: `internet`, plus this computer's localhost on
 ///   `localhost_ports` (every port only with `all_localhost_ports`);
 /// - `lan`: `internet`, plus your local network (not this computer);
+/// - `localhost+lan`: `internet`, plus both of the above (`localhost` and
+///   `lan` are independent extras; this is the one preset with both);
 /// - `custom`: `custom_base` (`internet` or `none`) plus `allow` and `deny`;
 /// - `unprotected`: everything but cloud metadata, other trees and the
 ///   daemon.
@@ -299,17 +302,18 @@ impl EgressEnforcement {
 /// preset is `unprotected`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record, Deserialize)]
 pub struct NetworkSettings {
-    /// `internet`, `none`, `localhost`, `lan`, `custom` or `unprotected`;
-    /// empty is `internet`.
+    /// `internet`, `none`, `localhost`, `lan`, `localhost+lan`, `custom` or
+    /// `unprotected`; empty is `internet`.
     #[uniffi(default)]
     #[serde(default)]
     pub preset: String,
-    /// `localhost`: the ports of this computer's localhost the Space may
-    /// reach.
+    /// `localhost` and `localhost+lan`: the ports of this computer's
+    /// localhost the Space may reach.
     #[uniffi(default)]
     #[serde(default)]
     pub localhost_ports: Vec<u16>,
-    /// `localhost`: every port (the daemon's stay blocked).
+    /// `localhost` and `localhost+lan`: every port (the daemon's stay
+    /// blocked).
     #[uniffi(default)]
     #[serde(default)]
     pub all_localhost_ports: bool,
@@ -5159,6 +5163,33 @@ impl Spaces {
         .await
     }
 
+    /// [`Spaces::relay_unregister`] for one of your computers
+    /// (`relay:<machine>`), choosing what happens to the Spaces it
+    /// provides: with `delete_spaces` false they stay on the account,
+    /// detached (they come back when the computer registers again); with
+    /// true they are deleted too, files first (through the computer while
+    /// it answers), then their records. Returns false when it was not on
+    /// the relay.
+    pub async fn relay_unregister_computer(
+        &self,
+        space: String,
+        delete_spaces: bool,
+    ) -> Result<bool> {
+        let host = self.host.clone();
+        run(async move {
+            let v = host
+                .tool_value(
+                    "relay_unregister_space",
+                    json!({"space": space, "delete_spaces": delete_spaces}),
+                )
+                .await?;
+            Ok(v.get("unregistered")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
+        })
+        .await
+    }
+
     /// A connected handle to a registered Space.
     pub async fn space(&self, space: String) -> Result<Arc<Space>> {
         let host = self.host.clone();
@@ -7255,7 +7286,7 @@ pub struct DriveStorage {
 }
 
 /// A storage change, or with `dry_run` a connection test.
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record, Serialize)]
+#[derive(Clone, PartialEq, Eq, uniffi::Record, Serialize)]
 pub struct DriveStorageUpdate {
     /// `fs` or `s3` (`cloud` is refused).
     pub backend: String,
@@ -7266,6 +7297,21 @@ pub struct DriveStorageUpdate {
     pub secret_access_key: Option<String>,
     /// Only test; change nothing.
     pub dry_run: bool,
+}
+
+impl std::fmt::Debug for DriveStorageUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DriveStorageUpdate")
+            .field("backend", &self.backend)
+            .field("s3", &self.s3)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "<redacted>"),
+            )
+            .field("dry_run", &self.dry_run)
+            .finish()
+    }
 }
 
 /// What a storage test found.

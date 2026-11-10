@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! FocusGuard — the focus posture of one background action.
 //!
 //! ## Layers

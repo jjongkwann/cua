@@ -19,7 +19,14 @@ export function useSummonIn() {
   /** What summoning reads for `spaceId`: its agents now and this device's connectors. */
   const summonInput = async (spaceId: string) => {
     const members = ((await host!.call("thread.members", { spaceId }).catch(() => null))?.members ?? []) as AgentMember[];
-    return { members: members.map((m) => ({ handle: m.name, harness: m.harness, label: m.name })), people: [], canAdd: true, connectors };
+    // The Space's handle for the member (`claude`), never the host's key for it (`claude-8` in `cua agent ls`): the thread matches the handle.
+    return {
+      members: members.map((m) => ({ handle: m.handle ?? m.name, key: m.name, mine: true, harness: m.harness, label: m.name })),
+      people: [],
+      canAdd: true,
+      reportUnknown: false,
+      connectors,
+    };
   };
   const send = (spaceId: string, input: Awaited<ReturnType<typeof summonInput>>) => (text: string) =>
     sendWithSummon({ core, data: host!, spaceId, input, text, post: (t) => host!.call("thread.post", { spaceId, text: t }) });
@@ -37,7 +44,14 @@ export function useSummonIn() {
     if (!first?.handle) return false;
     if (standby || model || brief) {
       await host!
-        .call("thread.agentAdd", { spaceId, name: first.handle, harness: first.harness || agent, ...(model ? { model } : {}), ...(standby ? { standby: true } : {}), ...(brief ? { brief } : {}) })
+        .call("thread.agentAdd", {
+          spaceId,
+          name: first.handle,
+          harness: first.harness || agent,
+          ...(model ? { model } : {}),
+          ...(standby ? { standby: true } : {}),
+          ...(brief ? { brief } : {}),
+        })
         .catch(() => null);
     }
     // The member is in now: the message goes with it listed.

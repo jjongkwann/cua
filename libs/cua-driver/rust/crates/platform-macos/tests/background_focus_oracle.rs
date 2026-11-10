@@ -190,7 +190,9 @@ mod native {
             front,
             workspace_front: platform_macos::apps::frontmost_pid(),
             key_focus: skylight::key_focus_pid(),
-            window: front.and_then(ax::focused_window_id_of_pid),
+            window: front
+                .and_then(ax::focused_window_id_of_pid)
+                .map(|window| window.own),
             element_window: front.and_then(ax::focused_element_window_id_of_pid),
         }
     }
@@ -951,7 +953,7 @@ mod native {
     /// The app's focused window is the main window again after a call that
     /// bound another window.
     fn focused_window_restored(fixture: &Fixture) -> Vec<String> {
-        let focused = ax::focused_window_id_of_pid(fixture.pid);
+        let focused = ax::focused_window_id_of_pid(fixture.pid).map(|window| window.own);
         if focused == Some(fixture.main) {
             Vec::new()
         } else {
@@ -1084,7 +1086,7 @@ mod native {
                     "main": fixture.main,
                     "secondary": fixture.secondary,
                     "journal": compact(&view.events),
-                    "ax_focused_window_after": ax::focused_window_id_of_pid(fixture.pid),
+                    "ax_focused_window_after": ax::focused_window_id_of_pid(fixture.pid).map(|window| window.own),
                 },
                 "user": {
                     "before": user_json(launched),
